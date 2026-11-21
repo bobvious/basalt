@@ -447,6 +447,33 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         return;
     }
     if (fa) q8 = far_kv.q8;
+    if (q8.q4) {
+        // 4-bit (q4_0 style): a group is one warp's 32 values.  d = the group's largest-magnitude value (signed) / -8 stored in
+        // fp16, code = round-half-up(x / d) + 8 clamped to 0 .. 15 against the stored d, so the largest value lands on code 0.
+        // The tie between two equal magnitudes of opposite sign is broken to the larger value so every lane agrees.  Even
+        // lanes pack their value (low nibble) with the next lane's (high).
+        float mk = y, mv = vv;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ok = __shfl_xor_sync(0xffffffffu, mk, o), ov = __shfl_xor_sync(0xffffffffu, mv, o);
+            if (fabsf(ok) > fabsf(mk) || (fabsf(ok) == fabsf(mk) && ok > mk)) mk = ok;
+            if (fabsf(ov) > fabsf(mv) || (fabsf(ov) == fabsf(mv) && ov > mv)) mv = ov;
+        }
+        const __half hk = __float2half_rn(mk / -8.0f), hv = __float2half_rn(mv / -8.0f);
+        const float sk = __half2float(hk), sv = __half2float(hv);
+        const float ik = sk != 0.0f ? 1.0f / sk : 0.0f, iv = sv != 0.0f ? 1.0f / sv : 0.0f;
+        const int ck = max(0, min(15, (int) floorf(y * ik + 8.5f))), cv = max(0, min(15, (int) floorf(vv * iv + 8.5f)));
+        const int pk = __shfl_xor_sync(0xffffffffu, ck, 1), pv = __shfl_xor_sync(0xffffffffu, cv, 1);
+        if ((d & 1) == 0) {
+            ((uint8_t*) q8.k)[at >> 1] = (uint8_t) (ck | (pk << 4));
+            ((uint8_t*) q8.v)[at >> 1] = (uint8_t) (cv | (pv << 4));
+        }
+        if ((d & 31) == 0) {
+            q8.ks[(cell * n_kv + head) * (HDW / 32) + d / 32] = __half_as_ushort(hk);
+            q8.vs[(cell * n_kv + head) * (HDW / 32) + d / 32] = __half_as_ushort(hv);
+        }
+        return;
+    }
     // int8: per 64 values, scale = amax / 127 (stored fp16), codes rounded to nearest against the stored scale; a group
     // is two warps: each warp's max by shuffles, then the pair's (a max is exact in any order)
     float ak = fabsf(y), av = fabsf(vv);

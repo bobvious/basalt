@@ -24,11 +24,16 @@ constexpr int kGqaMaxWindow = 16;
 
 /// An int8 K/V cache in place of the fp16 one: codes [cell][n_kv][256], fp16 scales [cell][n_kv][4] (one per 64 values,
 /// amax / 127, codes rounded to nearest).  `k` null: the fp16 cache.
+///
+/// `q4` set: the 4-bit cache instead (q4_0 style, symmetric, UNROTATED): `k` and `v` are packed codes [cell][n_kv][128], byte j
+/// of a row holding values 2j (low nibble) and 2j + 1 (high), each code value + 8 in 0 .. 15, and `ks`, `vs` are fp16 scales
+/// [cell][n_kv][8], one per 32 values (d = the group's largest-magnitude value / -8, the q4_0 rule; value = (code - 8) d).
 struct KvInt8 {
     int8_t* k = nullptr;
     int8_t* v = nullptr;
     uint16_t* ks = nullptr;
     uint16_t* vs = nullptr;
+    bool q4 = false;
 };
 
 /// A cache in two places: cells from `at` on are in these buffers instead (cell c at row c - at there, the same layout:
@@ -77,7 +82,8 @@ void gqa_window_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
 /// The device whose SM count plans the int8 prompt attention's launch (its key splits, so its rounding); -1 (the default):
 /// the current one.  A card that reads some of the main card's layers plans as the main card, so its rows are the main card's.
 void gqa_prompt_plan_device(int device);
-/// Scratch floats gqa_prompt_attn needs to split a T-row chunk's cells `splits` ways (an int8 cache).
+/// Scratch floats gqa_prompt_attn needs to split a T-row chunk's cells `splits` ways (an int8 cache; the 4-bit cache's prompt
+/// kernel does not split).
 size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits);
 /// `split_scratch` (optional, `split_floats` floats): lets an int8-cache launch split its cells over more blocks.
 void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, int n_head, int n_kv,

@@ -34,6 +34,18 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+// 4-bit cache (KvInt8::q4): 8 consecutive values of a row as fp16 from their 4 packed bytes (byte j: values 2j low, 2j + 1 high,
+// each code + 8) and the group's scale
+__device__ __forceinline__ uint4 q4_half8(unsigned w, float s) {
+    __half2 h[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int b = (int) ((w >> (8 * e)) & 0xffu);
+        h[e] = __floats2half2_rn((float) ((b & 15) - 8) * s, (float) ((b >> 4) - 8) * s);
+    }
+    return *reinterpret_cast<uint4*>(h);
+}
+
 // ---------------------------------------------------------------- decode
 // Row t of a window sees positions [lo_t, hi_t): hi_t = pos0 + t + 1 (causal) or `hi`, lo_t = pos0 + t - window + 1 (a
 // sliding window; pos0 - window + 1 for every row of a block's shared window; else 0); position p sits in cache cell p % cap.  Cells are split in CHUNK-position chunks from chunk
@@ -155,7 +167,7 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 // fp32 accumulate), an online softmax per row over its cells, O = O alpha + P V (P in fp16) on mma; the rows' partials
 // {max, sum, O} go to the merge.  Every row's arithmetic is its own (mma columns and rows never meet), the chunks follow
 // positions and the splits the capacity, so a row's bits are the same at any window width.
-template <int HD, bool I8>
+template <int HD, bool I8, bool Q4 = false>
 // (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__)
 __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks,
                                                          float scale, float* part_all) {
@@ -192,7 +204,13 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 if (ce >= r.cap) ce -= r.cap;
                 const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
-                if (q8.k) {
+                if (q8.q4) {
+                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
+                    const float sk = __half2float(__ushort_as_half(c8.ks[row * (HD / 32) + d8 / 32]));
+                    const float sv = __half2float(__ushort_as_half(c8.vs[row * (HD / 32) + d8 / 32]));
+                    kw = q4_half8(*reinterpret_cast<const unsigned*>(reinterpret_cast<const uint8_t*>(c8.k) + row * (HD / 2) + d8 / 2), sk);
+                    vw = q4_half8(*reinterpret_cast<const unsigned*>(reinterpret_cast<const uint8_t*>(c8.v) + row * (HD / 2) + d8 / 2), sv);
+                } else if (q8.k) {
                     const KvInt8& c8 = far_kv ? fr.q8 : q8;
                     const float sk = __half2float(__ushort_as_half(c8.ks[row * (HD / 64) + d8 / 64]));
                     const float sv = __half2float(__ushort_as_half(c8.vs[row * (HD / 64) + d8 / 64]));
@@ -234,7 +252,13 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 if (ce >= r.cap) ce -= r.cap;
                 const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
-                if constexpr (I8) {
+                if constexpr (Q4) {   // the codes: 4 bytes in the first word
+                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
+                    psk[j] = c8.ks[row * (HD / 32) + d8 / 32];
+                    psv[j] = c8.vs[row * (HD / 32) + d8 / 32];
+                    pk[j] = make_uint2(*reinterpret_cast<const unsigned*>(reinterpret_cast<const uint8_t*>(c8.k) + row * (HD / 2) + d8 / 2), 0u);
+                    pv[j] = make_uint2(*reinterpret_cast<const unsigned*>(reinterpret_cast<const uint8_t*>(c8.v) + row * (HD / 2) + d8 / 2), 0u);
+                } else if constexpr (I8) {
                     const KvInt8& c8 = far_kv ? fr.q8 : q8;
                     psk[j] = c8.ks[row * (HD / 64) + d8 / 64];
                     psv[j] = c8.vs[row * (HD / 64) + d8 / 64];
@@ -254,7 +278,10 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             const int idx = tid + j * 128, cell = idx / (HD / 8), d8 = (idx - cell * (HD / 8)) * 8;
             uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
             if ((pmask >> j) & 1u) {
-                if constexpr (I8) {
+                if constexpr (Q4) {
+                    kw = q4_half8(pk[j].x, __half2float(__ushort_as_half(psk[j])));
+                    vw = q4_half8(pv[j].x, __half2float(__ushort_as_half(psv[j])));
+                } else if constexpr (I8) {
                     const float sk = __half2float(__ushort_as_half(psk[j]));
                     const float sv = __half2float(__ushort_as_half(psv[j]));
                     int8_t kb[8], vb[8];
@@ -414,7 +441,8 @@ void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scr
     for (int k = 0; k < segs.n; ++k)
         segs.tile0[k + 1] = segs.tile0[k] + ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
     const dim3 grid((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]);
-    if (segs.q8[0].k) launch_pdl(decode_mma_kernel<HD, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    if (segs.q8[0].q4) launch_pdl(decode_mma_kernel<HD, true, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    else if (segs.q8[0].k) launch_pdl(decode_mma_kernel<HD, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
     else launch_pdl(decode_mma_kernel<HD, false>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
     check("gqa decode attention");
     launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) segs.row0[segs.n]), dim3(HD), 0, s,
@@ -972,6 +1000,177 @@ int opt_in_device() {
     return dev;
 }
 
+__device__ __forceinline__ void io_st2(float* p, float a, float b) { *reinterpret_cast<float2*>(p) = make_float2(a, b); }
+__device__ __forceinline__ void io_st2(__nv_bfloat16* p, float a, float b) {
+    *reinterpret_cast<__nv_bfloat162*>(p) = __floats2bfloat162_rn(a, b);
+}
+
+// ---------------------------------------------------------------- prompt, 4-bit cache
+// The fp16 cache's prompt kernel (prompt_f16_kernel: blocks of 96 rows, QK^T on fp16 tensor cores with fp32 accumulation, P V
+// summed in fp16 per 32-cell tile, online softmax in fp32) with each 32-cell K/V tile decoded from the 4-bit codes into the
+// shared fp16 tiles (code x scale, exact in fp16 up to its rounding), instead of copied.  The tile is fetched and decoded
+// synchronously (no double buffering) and never split over more blocks: simple and slower than the int8 cache's kernel.
+// IO: the queries and the output rows in FP32 or BF16.
+template <class IO>
+__global__ void __launch_bounds__(PNW * 32) prompt_q4_kernel(const IO* __restrict__ q, KvInt8 q8, int n_head, int n_kv,
+                                                             int64_t pos0, int64_t T, IO* __restrict__ out, KvFar far_kv) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    PromptSmem16& sm = *reinterpret_cast<PromptSmem16*>(smem_raw);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int G = n_head / n_kv, PB = PROWS / G;   // query heads per KV head, positions per tile
+    const int kvh = blockIdx.y;
+    const int64_t q0 = (int64_t) (gridDim.x - 1 - blockIdx.x) * PB;   // the longest tiles first
+    const int64_t last_pos = min(T, q0 + PB) - 1;
+    const int64_t cells = pos0 + last_pos + 1;
+    const int g = lane >> 2, tq = lane & 3;
+    const int ra = warp * 16 + g, rb = ra + 8;                         // this thread's two rows
+    const int64_t pos_a = q0 + ra / G, pos_b = q0 + rb / G;
+    const int head_a = kvh * G + ra % G, head_b = kvh * G + rb % G;
+
+    for (int i = tid; i < PROWS * HD / 4; i += PNW * 32) {
+        const int r = i / (HD / 4), c = (i % (HD / 4)) * 4;
+        const int64_t pos = q0 + r / G;
+        const int head = kvh * G + r % G;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (pos < T) {
+            const IO* src = q + (pos * n_head + head) * HD + c;
+            v = make_float4(io_ld(src), io_ld(src + 1), io_ld(src + 2), io_ld(src + 3));
+        }
+        *reinterpret_cast<__half2*>(&sm.q[r][c]) = __floats2half2_rn(v.x, v.y);
+        *reinterpret_cast<__half2*>(&sm.q[r][c + 2]) = __floats2half2_rn(v.z, v.w);
+    }
+
+    float o[HD / 8][4];
+#pragma unroll
+    for (int n = 0; n < HD / 8; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    float m_a = kNeg, m_b = kNeg, l_a = 0.0f, l_b = 0.0f;
+    const int n_tiles = (int) ((cells + PBN - 1) / PBN);
+
+    for (int ti = 0; ti < n_tiles; ++ti) {
+        const int64_t c0 = (int64_t) ti * PBN;
+        __syncthreads();   // the previous tile is consumed (and the query tile is written)
+        // the tile's K and V decoded to fp16 in shared memory (cells past the last visible one zero, so masked columns stay finite)
+        for (int i = tid; i < PBN * HD / 8; i += PNW * 32) {
+            const int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
+            uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
+            if (c0 + r < cells) {
+                int64_t cell = c0 + r;
+                const bool fa = kv_far(far_kv, cell);
+                const KvInt8& c8 = fa ? far_kv.q8 : q8;
+                const int64_t row = cell * n_kv + kvh;
+                const float sk = h2f(c8.ks[row * (HD / 32) + c / 32]), sv = h2f(c8.vs[row * (HD / 32) + c / 32]);
+                kw = q4_half8(*reinterpret_cast<const unsigned*>(reinterpret_cast<const uint8_t*>(c8.k) + row * (HD / 2) + c / 2), sk);
+                vw = q4_half8(*reinterpret_cast<const unsigned*>(reinterpret_cast<const uint8_t*>(c8.v) + row * (HD / 2) + c / 2), sv);
+            }
+            *reinterpret_cast<uint4*>(&sm.k[r][c]) = kw;
+            *reinterpret_cast<uint4*>(&sm.v[r][c]) = vw;
+        }
+        __syncthreads();
+
+        // S = Q K^T for the warp's 16 rows and the tile's 32 cells (four 8-cell tiles)
+        float s[PBN / 8][4];
+#pragma unroll
+        for (int n = 0; n < PBN / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < HD; k += 16) {
+            unsigned a0, a1, a2, a3;
+            ldsm_x4(a0, a1, a2, a3, &sm.q[warp * 16 + (lane & 15)][k + (lane >> 4) * 8]);
+#pragma unroll
+            for (int n = 0; n < PBN / 8; n += 2) {
+                unsigned b0, b1, b2, b3;
+                ldsm_x4(b0, b1, b2, b3, &sm.k[n * 8 + (lane & 7) + ((lane >> 4) << 3)][k + ((lane >> 3) & 1) * 8]);
+                mma16816(s[n], a0, a1, a2, a3, b0, b1);
+                mma16816(s[n + 1], a0, a1, a2, a3, b2, b3);
+            }
+        }
+        // mask and online softmax: thread holds rows ra (s[n][0..1]) and rb (s[n][2..3])
+        float mx_a = m_a, mx_b = m_b;
+#pragma unroll
+        for (int n = 0; n < PBN / 8; ++n)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t cell = c0 + n * 8 + tq * 2 + (i & 1);
+                const int64_t pos = i < 2 ? pos_a : pos_b;
+                const bool vis = cell <= pos0 + pos && cell < cells;
+                s[n][i] = vis ? s[n][i] * kScaleLog2 : kNeg;
+                if (i < 2) mx_a = fmaxf(mx_a, s[n][i]);
+                else mx_b = fmaxf(mx_b, s[n][i]);
+            }
+        mx_a = quad_max(mx_a);
+        mx_b = quad_max(mx_b);
+        const float sc_a = exp2f(m_a - mx_a), sc_b = exp2f(m_b - mx_b);
+        m_a = mx_a;
+        m_b = mx_b;
+        float ps_a = 0.0f, ps_b = 0.0f;
+#pragma unroll
+        for (int n = 0; n < PBN / 8; ++n) {
+            s[n][0] = s[n][0] <= kNeg ? 0.0f : exp2f(s[n][0] - m_a);
+            s[n][1] = s[n][1] <= kNeg ? 0.0f : exp2f(s[n][1] - m_a);
+            s[n][2] = s[n][2] <= kNeg ? 0.0f : exp2f(s[n][2] - m_b);
+            s[n][3] = s[n][3] <= kNeg ? 0.0f : exp2f(s[n][3] - m_b);
+            ps_a += s[n][0] + s[n][1];
+            ps_b += s[n][2] + s[n][3];
+        }
+        l_a = l_a * sc_a + ps_a;
+        l_b = l_b * sc_b + ps_b;
+        // O = O * scale + P V, the tile's P V summed in fp16 on the tensor cores
+        unsigned pa[PBN / 16][4];
+#pragma unroll
+        for (int j = 0; j < PBN / 16; ++j) {
+            pa[j][0] = pack_h2(s[2 * j][0], s[2 * j][1]);
+            pa[j][1] = pack_h2(s[2 * j][2], s[2 * j][3]);
+            pa[j][2] = pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]);
+            pa[j][3] = pack_h2(s[2 * j + 1][2], s[2 * j + 1][3]);
+        }
+#pragma unroll
+        for (int n = 0; n < HD / 8; n += 2) {
+            unsigned d0[2] = {0u, 0u}, d1[2] = {0u, 0u};
+#pragma unroll
+            for (int j = 0; j < PBN / 16; ++j) {
+                unsigned b0, b1, b2, b3;
+                // V rows are cells (k), columns dims (n): transposed loads give the col-major B of dims n*8.., n*8+8..
+                ldsm_x4_t(b0, b1, b2, b3, &sm.v[j * 16 + (lane & 15)][n * 8 + (lane >> 4) * 8]);
+                mma16816_h(d0, pa[j][0], pa[j][1], pa[j][2], pa[j][3], b0, b1);
+                mma16816_h(d1, pa[j][0], pa[j][1], pa[j][2], pa[j][3], b2, b3);
+            }
+            const float2 e0 = __half22float2(*reinterpret_cast<const __half2*>(&d0[0]));
+            const float2 e1 = __half22float2(*reinterpret_cast<const __half2*>(&d0[1]));
+            const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&d1[0]));
+            const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&d1[1]));
+            o[n][0] = fmaf(o[n][0], sc_a, e0.x); o[n][1] = fmaf(o[n][1], sc_a, e0.y);
+            o[n][2] = fmaf(o[n][2], sc_b, e1.x); o[n][3] = fmaf(o[n][3], sc_b, e1.y);
+            o[n + 1][0] = fmaf(o[n + 1][0], sc_a, f0.x); o[n + 1][1] = fmaf(o[n + 1][1], sc_a, f0.y);
+            o[n + 1][2] = fmaf(o[n + 1][2], sc_b, f1.x); o[n + 1][3] = fmaf(o[n + 1][3], sc_b, f1.y);
+        }
+    }
+    l_a = quad_sum(l_a);
+    l_b = quad_sum(l_b);
+    const float ia = l_a > 0.0f ? 1.0f / l_a : 0.0f, ib = l_b > 0.0f ? 1.0f / l_b : 0.0f;
+#pragma unroll
+    for (int n = 0; n < HD / 8; ++n) {
+        const int col = n * 8 + tq * 2;
+        if (pos_a < T) io_st2(out + (pos_a * n_head + head_a) * HD + col, o[n][0] * ia, o[n][1] * ia);
+        if (pos_b < T) io_st2(out + (pos_b * n_head + head_b) * HD + col, o[n][2] * ib, o[n][3] * ib);
+    }
+}
+
+template <class IO>
+void launch_prompt_q4(const IO* q, int n_head, int n_kv, int64_t pos0, int64_t T, IO* out, KvInt8 q8, cudaStream_t st, KvFar far_kv) {
+    static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device (and per instantiation)
+    const int dev = opt_in_device();
+    if (!raised[dev].load(std::memory_order_acquire)) {
+        if (cudaFuncSetAttribute(prompt_q4_kernel<IO>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(PromptSmem16)) !=
+            cudaSuccess) {
+            basalt::log::error("basalt", "gqa_prompt_attn: shared-memory opt-in failed");
+            std::exit(1);
+        }
+        raised[dev].store(true, std::memory_order_release);
+    }
+    const int pb = PROWS / (n_head / n_kv);
+    const dim3 grid((unsigned) ((T + pb - 1) / pb), (unsigned) n_kv);
+    prompt_q4_kernel<IO><<<grid, PNW * 32, sizeof(PromptSmem16), st>>>(q, q8, n_head, n_kv, pos0, T, out, far_kv);
+}
+
 template <int W, bool Split, class IO = float>
 void launch_prompt_i8(const IO* q, int n_head, int n_kv, int pos0, int T, IO* out, KvInt8 q8, int splits,
                       float* scratch, cudaStream_t st, KvFar far_kv) {
@@ -1112,13 +1311,18 @@ size_t gqa_prompt_split_floats(int64_t T, int n_head, int splits) {
 void gqa_prompt_attn_bf16(const uint16_t* q, int n_head, int n_kv, int64_t pos0, int64_t T, uint16_t* out, void* stream,
                           KvInt8 q8, float* split_scratch, size_t split_floats, KvFar far_kv) {
     if (T <= 0) return;
-    if (!q8.k || n_kv < 1 || n_head % n_kv || pos0 + T > INT32_MAX) {
-        basalt::log::error("basalt", "gqa_prompt_attn_bf16: an int8 cache and a supported head layout");
+    if (!q8.k || n_kv < 1 || n_head % n_kv || (q8.q4 && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX) {
+        basalt::log::error("basalt", "gqa_prompt_attn_bf16: an int8 or 4-bit cache and a supported head layout");
         std::exit(1);
     }
     const cudaStream_t st = (cudaStream_t) stream;
     const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(q);
     __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out);
+    if (q8.q4) {
+        launch_prompt_q4<__nv_bfloat16>(qb, n_head, n_kv, pos0, T, ob, q8, st, far_kv);
+        check("gqa_prompt_attn_bf16");
+        return;
+    }
     const I8Plan p = plan_prompt_i8(n_head, T, pos0 + T, split_scratch ? split_floats : 0);
     if (p.warps == 4) launch_prompt_i8<4, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st, far_kv);
     else if (p.splits == 1) launch_prompt_i8<8, false>(qb, n_head, n_kv, (int) pos0, (int) T, ob, q8, 1, nullptr, st, far_kv);
@@ -1130,12 +1334,14 @@ void gqa_prompt_attn(const float* q, const uint16_t* k_cache, const uint16_t* v_
                      int64_t pos0, int64_t T, float* out, void* stream, KvInt8 q8, float* split_scratch, size_t split_floats,
                      KvFar far_kv) {
     if (T <= 0) return;
-    if (n_kv < 1 || n_head % n_kv || (!q8.k && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX) {
+    if (n_kv < 1 || n_head % n_kv || ((!q8.k || q8.q4) && PROWS % (n_head / n_kv)) || pos0 + T > INT32_MAX) {
         basalt::log::error("basalt", "gqa_prompt_attn: unsupported head layout or cell count");
         std::exit(1);
     }
     const cudaStream_t st = (cudaStream_t) stream;
-    if (q8.k) {
+    if (q8.q4) {
+        launch_prompt_q4<float>(q, n_head, n_kv, pos0, T, out, q8, st, far_kv);
+    } else if (q8.k) {
         const I8Plan p = plan_prompt_i8(n_head, T, pos0 + T, split_scratch ? split_floats : 0);
         if (p.warps == 4) launch_prompt_i8<4, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far_kv);
         else if (p.splits == 1) launch_prompt_i8<8, false>(q, n_head, n_kv, (int) pos0, (int) T, out, q8, 1, nullptr, st, far_kv);

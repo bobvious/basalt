@@ -43,7 +43,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         blockbytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
                       (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
     }
-    const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_int8, m.o.kv_resident, m.lb, m.le);
+    const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_format(), m.o.kv_resident, m.lb, m.le);
     if (!st.arena.reserve(dev_bytes + blockbytes)) {
         err = m.o.arch + ": out of device memory for a session of " + std::to_string((long long) m.o.max_context) +
               " cells (" + std::to_string((unsigned long long) (dev_bytes >> 20)) + " MiB); lower --max-context or --parallel";
@@ -66,7 +66,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     const size_t n_near = (size_t) near_cells * g.n_kv * g.head_dim, n_far = cells - n_near;
     uint8_t* host = nullptr;
     if (n_far > 0 && m.n_attn > 0) {
-        const uint64_t hb = session_host_bytes(g, m.o.max_context, m.o.kv_int8, m.o.kv_resident) / (uint64_t) g.attn_layers() * m.n_attn;
+        const uint64_t hb = session_host_bytes(g, m.o.max_context, m.o.kv_format(), m.o.kv_resident) / (uint64_t) g.attn_layers() * m.n_attn;
         if (cudaHostAlloc(&st.far_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             cudaGetLastError();
             st.far_host = nullptr;
@@ -79,7 +79,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
     // the far cells of one layer, carved from the host block (device-mapped: the same address on the card)
     const auto far_view = [&](kernels::KvFar& f) {
         f.at = near_cells;
-        if (m.o.kv_int8) {
+        if (m.o.kv_quant) {   // (never a 4-bit cache: make_model refuses to stream it)
             f.q8.k = (int8_t*) host;
             f.q8.v = f.q8.k + n_far;
             f.q8.ks = (uint16_t*) (f.q8.v + n_far);
@@ -95,11 +95,19 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         kernels::KvInt8 q8;
         st.far_kv.emplace_back();
         if (n_far > 0) far_view(st.far_kv.back());
-        if (m.o.kv_int8) {
-            q8.k = st.arena.take<int8_t>(n_near);
-            q8.v = st.arena.take<int8_t>(n_near);
-            q8.ks = st.arena.take<uint16_t>(n_near / 64);
-            q8.vs = st.arena.take<uint16_t>(n_near / 64);
+        if (m.o.kv_quant) {
+            if (m.o.kv_q4) {   // two codes to a byte, a scale per 32 values
+                q8.q4 = true;
+                q8.k = st.arena.take<int8_t>(n_near / 2);
+                q8.v = st.arena.take<int8_t>(n_near / 2);
+                q8.ks = st.arena.take<uint16_t>(n_near / 32);
+                q8.vs = st.arena.take<uint16_t>(n_near / 32);
+            } else {
+                q8.k = st.arena.take<int8_t>(n_near);
+                q8.v = st.arena.take<int8_t>(n_near);
+                q8.ks = st.arena.take<uint16_t>(n_near / 64);
+                q8.vs = st.arena.take<uint16_t>(n_near / 64);
+            }
             st.kc.push_back(nullptr);
             st.vc.push_back(nullptr);
             if (!q8.vs) {
@@ -149,7 +157,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         st.picks = st.arena.take<int32_t>(kWindow);
     }
     st.n_keep = st.arena.take<int32_t>(4);
-    if (!st.n_keep || (ng && !st.gdn) || (!st.kc.empty() && !m.o.kv_int8 && !st.vc.back())) {
+    if (!st.n_keep || (ng && !st.gdn) || (!st.kc.empty() && !m.o.kv_quant && !st.vc.back())) {
         err = m.o.arch + ": a session's buffers do not fit its arena";
         return false;
     }
@@ -545,9 +553,12 @@ public:
         return {};
     }
 
-    // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP
-    // drafter's own layer is fp16 and comes last
-    size_t row_bytes(bool int8) const { return (size_t) g_.n_kv * g_.head_dim * (int8 ? 1 : 2); }
+    // a layer's cells: fp16 K and V (format 1), int8 codes with fp16 scales per 64 values (format 2), or 4-bit codes (two to a
+    // byte) with fp16 scales per 32 values (format 3); the MTP drafter's own layer is fp16 and comes last.  kf: 0 fp16, 1 int8, 2 4-bit
+    size_t row_bytes(int kf) const { return (size_t) g_.n_kv * g_.head_dim * (kf == 0 ? 2 : 1) / (kf == 2 ? 2 : 1); }
+    // the bytes of codes per byte of scales: int8's 64 values take 2 scale bytes (32), a 4-bit cache's 32 values 2 (8)
+    static size_t scale_div(int kf) { return kf == 2 ? 8 : 32; }
+    int cache_kf(bool mtp) const { return mtp || !m_.o.kv_quant ? 0 : m_.o.kv_q4 ? 2 : 1; }
     // the conversation's attention layers: the main card's, then the second card's (a layer split); kv_state maps i to its
     // card's state and its index there
     size_t kv_layers() const { return st_.kc.size() + (st_.peer ? st_.peer->kc.size() : 0); }
@@ -557,8 +568,9 @@ public:
         return *st_.peer;
     }
     size_t cells_bytes(int64_t positions) const override {
-        const size_t main = m_.o.kv_int8 ? 2 * (row_bytes(true) + row_bytes(true) / 32) : 2 * row_bytes(false);
-        return (size_t) positions * (kv_layers() * main + (drafter_ ? 2 * row_bytes(false) : 0));
+        const int kf = cache_kf(false);
+        const size_t main = kf ? 2 * (row_bytes(kf) + row_bytes(kf) / scale_div(kf)) : 2 * row_bytes(0);
+        return (size_t) positions * (kv_layers() * main + (drafter_ ? 2 * row_bytes(0) : 0));
     }
 
     Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
@@ -579,21 +591,22 @@ public:
             size_t j = i;
             const SessionState& ls = mtp ? st_ : kv_state(j);
             const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
-            const bool int8 = !mtp && m_.o.kv_int8;
+            const int kf = cache_kf(mtp);
             core::ConversationKv k;
-            k.format = int8 ? 2 : 1;
+            k.format = kf == 2 ? 3 : kf == 1 ? 2 : 1;
             k.cells = positions;
             k.heads = g_.n_kv;
             k.head_dim = g_.head_dim;
             k.page_size = 1;
-            const size_t rows = (size_t) positions * row_bytes(int8);
+            const size_t rows = (size_t) positions * row_bytes(kf);
             const kernels::KvFar f = mtp ? kernels::KvFar{} : ls.far_kv[j];
-            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(kf);
             bool ok;
-            if (int8) {
+            if (kf) {
                 const kernels::KvInt8& q = ls.kq[j];
+                const size_t sd = scale_div(kf);
                 ok = down(q.k, f.q8.k, split, k.k, rows) && down(q.v, f.q8.v, split, k.v, rows) &&
-                     down(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && down(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
+                     down(q.ks, f.q8.ks, split / sd, k.k_scale, rows / sd) && down(q.vs, f.q8.vs, split / sd, k.v_scale, rows / sd);
             } else {
                 ok = down(mtp ? st_.mtp_kc : ls.kc[j], f.k, split, k.k, rows) && down(mtp ? st_.mtp_vc : ls.vc[j], f.v, split, k.v, rows);
             }
@@ -620,18 +633,19 @@ public:
             size_t j = i;
             const SessionState& ls = mtp ? st_ : kv_state(j);
             const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
-            const bool int8 = !mtp && m_.o.kv_int8;
+            const int kf = cache_kf(mtp);
             const core::ConversationKv& k = kv[i];
-            if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
+            if (k.format != (kf == 2 ? 3 : kf == 1 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
                 return fail(m_.o.arch + ": a parked conversation has other caches");
-            const size_t rows = (size_t) positions * row_bytes(int8);
+            const size_t rows = (size_t) positions * row_bytes(kf);
             const kernels::KvFar f = mtp ? kernels::KvFar{} : ls.far_kv[j];
-            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(kf);
             bool ok;
-            if (int8) {
+            if (kf) {
                 const kernels::KvInt8& q = ls.kq[j];
+                const size_t sd = scale_div(kf);
                 ok = up(q.k, f.q8.k, split, k.k, rows) && up(q.v, f.q8.v, split, k.v, rows) &&
-                     up(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && up(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
+                     up(q.ks, f.q8.ks, split / sd, k.k_scale, rows / sd) && up(q.vs, f.q8.vs, split / sd, k.v_scale, rows / sd);
             } else {
                 ok = up(mtp ? st_.mtp_kc : ls.kc[j], f.k, split, k.k, rows) && up(mtp ? st_.mtp_vc : ls.vc[j], f.v, split, k.v, rows);
             }
@@ -689,7 +703,7 @@ public:
     }
 
     std::string info_words() const override {
-        const std::string kv = m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
+        const std::string kv = m_.o.kv_q4 ? "kv=q4" : m_.o.kv_quant ? "kv=int8" : "kv=fp16";
         // a dense model has no routed experts, so none can sit on the SSD (the community check reads this)
         // host_weight_bytes: model weights held in host RAM, none for the dense stack (the community check refuses a row if
         // any). gpu_weight_bytes is what the load log calls "GiB on the GPU". The token embedding and the --vision dynamic encoder wait in host RAM by design and are told apart.

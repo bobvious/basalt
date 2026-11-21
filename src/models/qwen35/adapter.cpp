@@ -83,7 +83,8 @@ dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions
     o.draft = draft;
     o.drafter = block ? dense::Drafter::Block : mtp ? dense::Drafter::Mtp : dense::Drafter::None;
     o.vision = vision;
-    o.kv_int8 = kv == "int8";
+    o.kv_quant = kv == "int8" || kv == "q4";
+    o.kv_q4 = kv == "q4";   // 4-bit K/V (q4_0 style, unrotated; kernels::KvInt8::q4), the 27B's only: see HELIX-KV-Q4.md
     o.kv_resident = kv_resident;
     o.arch = "qwen35";
     return o;
@@ -182,6 +183,11 @@ private:
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
+        if (o.kv_q4 && (!req.peer_devices.empty() || o.kv_resident > 0)) {   // refused, not implemented: see HELIX-KV-Q4.md
+            err = std::string("qwen35: --kv q4 does not support ") +
+                  (o.kv_resident > 0 ? "K/V streaming (--kv-resident)" : "a second card (a layer split or a prompt split): use --gpu with one card");
+            return false;
+        }
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
@@ -290,13 +296,13 @@ private:
             core::model_sources(file, srcs);
             o.mmproj = srcs.vision;
         }
-        const uint64_t need_b = dense::shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident) +
-                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8,
+        const uint64_t need_b = dense::shared_bytes(g, o.max_context, o.kv_format(), o.kv_resident) +
+                                (uint64_t) o.sessions * dense::session_bytes(g, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_format(),
                                                                              o.kv_resident, 0, split_at_) +
                                 (req.peer_devices.empty() ? 0
                                  : split_at_ > 0           ? dense::stage_main_bytes(g, w.dflash)
                                                            : dense::prompt_split_main_bytes(g, w.dflash, o.max_context));
-        if (const uint64_t host_b = dense::session_host_bytes(g, o.max_context, o.kv_int8, o.kv_resident))
+        if (const uint64_t host_b = dense::session_host_bytes(g, o.max_context, o.kv_format(), o.kv_resident))
             basalt::log::info("basalt qwen35", "K/V streaming: %lld of %lld cells per attention layer in VRAM, %.2f GiB in page-locked "
                               "RAM per slot", (long long) dense::resident_cells(o.max_context, o.kv_resident), (long long) o.max_context,
                               (double) host_b / 1073741824.0);
@@ -664,8 +670,12 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "int8") {
-            basalt::log::error("basalt qwen35", "--kv %s: fp16 (the default) or int8", o.kv.c_str());
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "int8" && o.kv != "q4") {
+            basalt::log::error("basalt qwen35", "--kv %s: fp16 (the default), int8 or q4", o.kv.c_str());
+            return 2;
+        }
+        if (o.kv == "q4" && o.kv_resident > 0) {
+            basalt::log::error("basalt qwen35", "--kv q4 does not support K/V streaming (--kv-resident %lld)", (long long) o.kv_resident);
             return 2;
         }
         if (const auto code = model::check_rope_flags(o.rope, "basalt qwen35")) return code;

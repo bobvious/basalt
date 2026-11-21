@@ -29,6 +29,8 @@ void usage() {
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
                  "  --kv fp16|int8       KV storage: int8 codes + fp16 scale per 64 values, half the\n"
                  "                       VRAM; default fp16\n"
+                 "  --kv q4              Qwen3.8-27B: 4-bit K/V (q4_0 style, a scale per 32 values, no rotation),\n"
+                 "                       55%% of int8's memory; one card, not with --kv-resident\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation: half of int8's memory,\n"
                  "                       slightly lower precision\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"

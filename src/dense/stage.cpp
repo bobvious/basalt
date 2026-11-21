@@ -199,7 +199,7 @@ std::vector<Region> cell_regions(const Model& m, const SessionState& main, const
     std::vector<Region> r;
     const size_t row = (size_t) m.g.n_kv * m.g.head_dim;
     for (int ai = ai0; ai < m.g.attn_layers(); ++ai) {
-        if (m.o.kv_int8) {
+        if (m.o.kv_quant) {
             const kernels::KvInt8 &a = main.kq[(size_t) ai], &b = stage.kq[(size_t) ai];
             r.push_back({a.k + c0 * row, b.k + c0 * row, (size_t) n * row});
             r.push_back({a.v + c0 * row, b.v + c0 * row, (size_t) n * row});
@@ -421,11 +421,11 @@ static bool calibrate(Stage& L, Model& main, std::string& err) {
     SessionState s;
     s.gdn_floats = L.st.gdn_floats;
     const int ai0 = count_kind(g, L.lo, Mixer::Attention);
-    const size_t need = (size_t) g.gdn_layers() * s.gdn_floats * 4 + (size_t) na * (size_t) (far_pos + kChunk) * cell_bytes(g, main.o.kv_int8) +
-                        (size_t) ai0 * kChunk * cell_bytes(g, main.o.kv_int8) + (size_t) g.attn_layers() * 4 * 256 + 4096;
+    const size_t need = (size_t) g.gdn_layers() * s.gdn_floats * 4 + (size_t) na * (size_t) (far_pos + kChunk) * cell_bytes(g, main.o.kv_quant) +
+                        (size_t) ai0 * kChunk * cell_bytes(g, main.o.kv_quant) + (size_t) g.attn_layers() * 4 * 256 + 4096;
     bool ok = far_pos > 0 && a.reserve(need) && cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking) == cudaSuccess;
     s.gdn = ok ? a.take<float>((size_t) g.gdn_layers() * s.gdn_floats) : nullptr;
-    ok = ok && s.gdn && take_cells(a, s, g, main.o.kv_int8, ai0, far_pos + kChunk, kChunk);
+    ok = ok && s.gdn && take_cells(a, s, g, main.o.kv_quant, ai0, far_pos + kChunk, kChunk);
     // the cells the runs further on read hold random values too: what attention multiplies moves a card's speed as well
     const auto fill = [&](const SessionState& ss, cudaStream_t st) {
         for (const Region& r : cell_regions(main, ss, ss, ai0, 0, far_pos)) {
@@ -593,6 +593,10 @@ bool Stage::open(Model& main, int d, int l, const Weights& w, bool split, std::s
 }
 
 StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, std::string& err) {
+    if (main.o.kv_q4) {   // the stage's cell copies and calibration know int8 and fp16 rows only
+        err = main.o.arch + ": --kv q4 does not support a prompt split over two cards";
+        return nullptr;
+    }
     StagePtr p(new Stage());
     Stage& L = *p;
     const Geometry& g = main.g;
@@ -609,11 +613,11 @@ StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, st
         s.gdn_floats = (size_t) g.gdn_state * HV * g.gdn_state + C * 3;
         const int ai0 = count_kind(g, l_min, Mixer::Attention);
         const size_t need = (size_t) g.gdn_layers() * s.gdn_floats * 4 +
-                            (size_t) (g.attn_layers() - ai0) * (size_t) L.max_context * cell_bytes(g, main.o.kv_int8) +
+                            (size_t) (g.attn_layers() - ai0) * (size_t) L.max_context * cell_bytes(g, main.o.kv_quant) +
                             Stage::kSlots * T * H * 2 + (size_t) g.attn_layers() * 4 * 256 + 4096;
         if (!L.arena.reserve(need)) return fail(std::to_string((unsigned long long) (need >> 20)) + " MiB of cells do not fit");
         s.gdn = s.gdn_first = L.arena.take<float>((size_t) g.gdn_layers() * s.gdn_floats);
-        if (!take_cells(L.arena, s, g, main.o.kv_int8, ai0, L.max_context)) return fail("its cells do not fit their arena");
+        if (!take_cells(L.arena, s, g, main.o.kv_quant, ai0, L.max_context)) return fail("its cells do not fit their arena");
         for (uint16_t*& b : L.lin) b = L.arena.take<uint16_t>(T * H);
         if (!L.lin[Stage::kSlots - 1]) return fail("its buffers do not fit their arena");
         bool ok = true;
@@ -629,7 +633,7 @@ StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, st
         ok = ok && cudaEventCreateWithFlags(&L.back, cudaEventDisableTiming) == cudaSuccess;
         if (!ok) return fail("cannot create its streams and events");
     }
-    L.kv_bytes = (size_t) (g.attn_layers() - count_kind(g, l_min, Mixer::Attention)) * T * cell_bytes(g, main.o.kv_int8);
+    L.kv_bytes = (size_t) (g.attn_layers() - count_kind(g, l_min, Mixer::Attention)) * T * cell_bytes(g, main.o.kv_quant);
     L.state_bytes = (size_t) (g.gdn_layers() - count_kind(g, l_min, Mixer::Gdn)) * L.st.gdn_floats * 4;
     bool ok = pin(L.state, L.state_bytes);
     for (int k = 0; k < Stage::kSlots; ++k) ok = ok && pin(L.kv[k], L.kv_bytes);
@@ -898,6 +902,10 @@ void PeerStateDeleter::operator()(SessionState* s) const {
 }
 
 bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err) {
+    if (m.o.kv_q4) {
+        err = m.o.arch + ": --kv q4 does not support a layer split over two cards";
+        return false;
+    }
     const Geometry& g = m.g;
     const size_t H = (size_t) g.n_embd, slot = (size_t) kBatch * H * 2;
     int main_dev = 0;

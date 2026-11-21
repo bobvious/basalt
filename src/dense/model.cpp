@@ -313,38 +313,37 @@ bool attach_drafter(Model& m, std::string& err) {
 }
 
 namespace {
-// a cell of one attention layer, K and V: fp16, or int8 codes with their fp16 scales
-uint64_t cell_bytes(const Geometry& g, bool kv_int8) {
-    return kv_int8 ? (uint64_t) g.n_kv * (g.head_dim + g.head_dim / 64 * 2) * 2 : (uint64_t) g.n_kv * g.head_dim * 2 * 2;
-}
+// a cell of one attention layer, K and V: fp16, int8 codes with their fp16 scales (one per 64 values), or 4-bit codes (two per
+// byte) with their fp16 scales (one per 32 values)
+uint64_t cell_bytes(const Geometry& g, KvFormat kv) { return kv_cell_bytes(g.n_kv, g.head_dim, kv); }
 }  // namespace
 
 int64_t resident_cells(int64_t max_context, int64_t kv_resident) {
     return kv_resident > 0 && kv_resident < max_context ? kv_resident : max_context;
 }
 
-uint64_t shared_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident) {
-    const uint64_t stage = g.attn_layers() > 0 ? (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * cell_bytes(g, kv_int8) : 0;
+uint64_t shared_bytes(const Geometry& g, int64_t max_context, KvFormat kv, int64_t kv_resident) {
+    const uint64_t stage = g.attn_layers() > 0 ? (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * cell_bytes(g, kv) : 0;
     return window_bytes(g, BlockDrafter{}, max_context) + chunk_bytes(g) + stage + (512ull << 20);
 }
 
-uint64_t session_host_bytes(const Geometry& g, int64_t max_context, bool kv_int8, int64_t kv_resident) {
-    return (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * g.attn_layers() * cell_bytes(g, kv_int8);
+uint64_t session_host_bytes(const Geometry& g, int64_t max_context, KvFormat kv, int64_t kv_resident) {
+    return (uint64_t) (max_context - resident_cells(max_context, kv_resident)) * g.attn_layers() * cell_bytes(g, kv);
 }
 
-uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, bool kv_int8, int64_t kv_resident) {
+uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, KvFormat kv, int64_t kv_resident) {
     if (g.kinds[(size_t) il] == Mixer::Gdn) {
         const uint64_t C = (uint64_t) g.conv_channels();
         return (2 * ((uint64_t) g.gdn_state * g.gdn_v_heads * g.gdn_state + C * 3) + kWindow * (2 * C + 2 * (uint64_t) g.gdn_v_heads)) * 4;
     }
-    return (uint64_t) resident_cells(max_context, kv_resident) * cell_bytes(g, kv_int8) + 4 * 256;
+    return (uint64_t) resident_cells(max_context, kv_resident) * cell_bytes(g, kv) + 4 * 256;
 }
 
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8, int64_t kv_resident, int lb, int le) {
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, KvFormat kv, int64_t kv_resident, int lb, int le) {
     uint64_t b = 64 * 256;
-    for (int il = lb; il < (le > 0 ? le : g.n_layers); ++il) b += session_layer_bytes(g, il, max_context, kv_int8, kv_resident);
+    for (int il = lb; il < (le > 0 ? le : g.n_layers); ++il) b += session_layer_bytes(g, il, max_context, kv, kv_resident);
     if (lb > 0) return b;
-    const uint64_t drafter = mtp ? (uint64_t) max_context * cell_bytes(g, false) + ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4
+    const uint64_t drafter = mtp ? (uint64_t) max_context * cell_bytes(g, KvFormat::Fp16) + ((uint64_t) (kWindow + 3) * g.n_embd + g.n_vocab + (uint64_t) kWindow * 64) * 4
                                  : 0;
     return b + drafter + (uint64_t) kWindow * g.n_vocab * 4;
 }
@@ -363,12 +362,12 @@ SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter
     in.slots = std::max(o.sessions, 1);
     uint64_t layers = 0;
     for (int il = 0; il < g.n_layers; ++il) {
-        in.per_slot.push_back(session_layer_bytes(g, il, o.max_context, o.kv_int8, o.kv_resident));
+        in.per_slot.push_back(session_layer_bytes(g, il, o.max_context, o.kv_format(), o.kv_resident));
         layers += in.per_slot.back();
     }
-    const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_int8, o.kv_resident) - layers +
+    const uint64_t slot_rest = session_bytes(g, o.max_context, mtp, o.kv_format(), o.kv_resident) - layers +
                                (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
-    const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident);
+    const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_format(), o.kv_resident);
     in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + stage_main_bytes(g, bd);
     in.peer_fixed = scratch + 2ull * kChunk * g.n_embd * 2;   // its own scratch and the landing residuals
     in.main = main_card;
@@ -520,6 +519,18 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         err = o.arch + ": " + e;
         return nullptr;
     }
+    if (o.kv_q4) {   // the 4-bit cache: head width 256 kernels, no streaming, no layer split (see HELIX-KV-Q4.md)
+        const char* why = !o.kv_quant                                                   ? "an inconsistent KV format"
+                          : g.head_dim != 256                                           ? "attention heads of other than 256 values"
+                          : g.n_head % g.n_kv || 96 % (g.n_head / g.n_kv)               ? "this head layout (the prompt kernel's 96-row blocks)"
+                          : resident_cells(o.max_context, o.kv_resident) < o.max_context ? "K/V streaming (--kv-resident)"
+                          : o.layer_begin != 0 || (o.layer_end > 0 && o.layer_end < g.n_layers) ? "a layer split over two cards"
+                                                                                                : nullptr;
+        if (why) {
+            err = o.arch + ": --kv q4 does not support " + why;
+            return nullptr;
+        }
+    }
     m->lb = o.layer_begin;
     m->le = o.layer_end > 0 ? o.layer_end : g.n_layers;
     if (m->lb < 0 || m->lb >= m->le || m->le > g.n_layers) {
@@ -628,7 +639,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         // the prompt chunks' VRAM copy of one layer's far cells, laid out as a session's far buffers
         const size_t cells = (size_t) (o.max_context - kept) * g.n_kv * g.head_dim;
         void* p = nullptr;
-        if (cudaMalloc(&p, (size_t) (o.max_context - kept) * cell_bytes(g, o.kv_int8)) != cudaSuccess ||
+        if (cudaMalloc(&p, (size_t) (o.max_context - kept) * cell_bytes(g, o.kv_format())) != cudaSuccess ||
             cudaStreamCreateWithFlags(&m->stage_side, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->stage_free, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->stage_ready, cudaEventDisableTiming) != cudaSuccess) {
@@ -639,7 +650,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         m->owned.push_back(p);
         kernels::KvFar& f = m->stage;
         f.at = kept;
-        if (o.kv_int8) {
+        if (o.kv_quant) {   // (a 4-bit cache is never streamed: make_model refused it above)
             f.q8.k = (int8_t*) p;
             f.q8.v = f.q8.k + cells;
             f.q8.ks = (uint16_t*) (f.q8.v + cells);
