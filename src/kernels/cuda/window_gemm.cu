@@ -161,17 +161,20 @@ int resident(const Kernel& k) {
 }
 
 // An F8 call's warps per block (its K slices), from its shapes alone: more slices when its 16-row tiles are few
-int f8_warps(const Call& c) {
+int64_t f8_tiles(const Call& c) {
     int64_t tiles = 0;
     for (int i = 0; i < c.n; ++i) tiles += (c.m[i].rows + 15) / 16;
-    if (c.K % 512 == 0 && tiles < 512) return 8;
+    return tiles;
+}
+int f8_warps(const Call& c) {
+    if (c.K % 512 == 0 && f8_tiles(c) < 512) return 8;
     return c.K % 256 == 0 ? 4 : 2;
 }
 
 const Kernel& kernel_for(const Call& c, int nt) {
     const bool swiglu = c.epi == Epilogue::SwiGLU;
     if (c.fmt != Format::Nvfp4 && swiglu) refuse("an FP8 or BF16 SwiGLU pair", c);
-    if (c.fmt == Format::F8) return detail::f8(f8_warps(c), nt);
+    if (c.fmt == Format::F8) return detail::f8(f8_warps(c), nt, (int) f8_tiles(c));
     if (c.fmt == Format::Bf16) return detail::bf16(nt);
     if (c.fmt == Format::Q8) return detail::q8(nt);
     return swiglu ? detail::nvfp4_swiglu(nt) : detail::nvfp4(nt);

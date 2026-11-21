@@ -8,7 +8,8 @@ namespace basalt::kernels::wgemm::detail {
 
 /// The kernel for windows of up to 8 (nt 1), 16 (nt 2) or 32 (nt 4) rows.  Every nt of a kind has the same block shape;
 /// F8 with kw warps on K slices (window_gemm_sliced.cuh).
-const Kernel& f8(int kw, int nt);
+constexpr int kDeepTiles = 256;   // an F8 call of fewer 16-row tiles stages two groups at NT 2 (window_gemm_f8.cu)
+const Kernel& f8(int kw, int nt, int tiles);
 const Kernel& bf16(int nt);
 const Kernel& q8(int nt);
 const Kernel& nvfp4(int nt);

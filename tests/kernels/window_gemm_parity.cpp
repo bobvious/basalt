@@ -514,7 +514,7 @@ void parity_row_scales(int64_t rows, int64_t K) {
     cudaFree(d_w); cudaFree(d_x); cudaFree(d_rs); cudaFree(d_sc); cudaFree(d_rs1); cudaFree(act); cudaFree(d_y); cudaFree(d_y2);
 }
 
-void bench_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool swiglu) {
+void bench_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool swiglu, std::vector<int> Ts = {1, 8, 16, 32}) {
     const size_t wb = fmt == wg::Format::F8 ? (size_t) rows * K : fmt == wg::Format::Bf16 ? (size_t) rows * K * 2
                       : fmt == wg::Format::Q8 ? (size_t) rows * K / 32 * 34 : np::bytes(rows, K);
     const size_t per = swiglu ? 2 * wb : wb;
@@ -557,7 +557,7 @@ void bench_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool 
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
-    for (int T : {1, 8, 16, 32}) {
+    for (int T : Ts) {
         int it = 0;
         for (int i = 0; i < copies; ++i) {
             set(it++ % copies);
@@ -580,17 +580,105 @@ void bench_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool 
     cudaFree(d_x); cudaFree(act); cudaFree(d_y);
 }
 
+// FNV-1a of a buffer
+uint64_t fnv(const void* p, size_t n, uint64_t h) {
+    const uint8_t* b = (const uint8_t*) p;
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// --golden: a hash of every output bit at T = 1..32 of each bench shape (fixed data), to compare across code versions
+void golden_call(const char* name, wg::Format fmt, int64_t rows, int64_t K, bool swiglu) {
+    rng.seed(7);
+    const bool q8 = fmt == wg::Format::Q8;
+    const Mat m = q8 ? Mat{fmt, rows, K, {}} : make_mat(fmt, rows, K);
+    Mat m2{fmt, 0, 0, {}};
+    if (swiglu) m2 = make_mat(fmt, rows, K);
+    const auto x = make_x(K);
+    uint8_t* d_w = nullptr;
+    if (q8) {
+        std::vector<uint8_t> blk((size_t) rows * K / 32 * 34);
+        std::normal_distribution<float> nd;
+        for (size_t b = 0; b < blk.size() / 34; ++b) {
+            const __half d = __float2half(0.01f * (1.0f + 0.5f * nd(rng)));
+            std::memcpy(&blk[b * 34], &d, 2);
+            for (int k = 0; k < 32; ++k) blk[b * 34 + 2 + k] = (uint8_t) (int8_t) (rng() % 255 - 127);
+        }
+        uint8_t* d_blk = up(blk);
+        cudaMalloc(&d_w, blk.size());
+        wg::q8_planes(d_blk, rows, K, d_w, nullptr);
+        cudaDeviceSynchronize();
+        cudaFree(d_blk);
+    } else {
+        d_w = up(m.bytes);
+    }
+    uint8_t* d_w2 = swiglu ? up(m2.bytes) : nullptr;
+    float* d_x = up(x);
+    void* act;
+    cudaMalloc(&act, wg::act_bytes(K));
+    float* d_y;
+    cudaMalloc(&d_y, (size_t) R * rows * 4);
+    void* d_h = nullptr;
+    if (swiglu) cudaMalloc(&d_h, wg::act_bytes(rows));
+    float* d_sc = up(std::vector<float>{0.03f});
+    wg::Call c;
+    c.fmt = fmt;
+    c.K = K;
+    c.m[0] = {d_w, rows, d_sc, d_y, rows};
+    if (swiglu) {
+        c.n = 2;
+        c.epi = wg::Epilogue::SwiGLU;
+        c.m[1] = {d_w2, rows, d_sc, nullptr, rows};
+        c.act_out = d_h;
+    }
+    need(c);
+    uint64_t h = 1469598103934665603ull;
+    for (int T = 1; T <= R; ++T) {
+        wg::pack(d_x, K, K, T, act, nullptr);
+        cudaMemset(d_y, 0xFF, (size_t) R * rows * 4);
+        if (swiglu) cudaMemset(d_h, 0xFF, wg::act_bytes(rows));
+        wg::gemm(c, act, T, ws, nullptr);
+        const auto y = down(d_y, (size_t) R * rows);
+        h = fnv(y.data(), y.size() * 4, h);
+        if (swiglu) {
+            const auto hh = down((const uint16_t*) d_h, (size_t) R * rows);
+            h = fnv(hh.data(), hh.size() * 2, h);
+        }
+    }
+    std::printf("golden %-24s %016llx\n", name, (unsigned long long) h);
+    cudaFree(d_w); cudaFree(d_w2); cudaFree(d_x); cudaFree(act); cudaFree(d_y); cudaFree(d_h); cudaFree(d_sc);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) return 77;
+    if (argc > 1 && std::strcmp(argv[1], "--golden") == 0) {
+        for (const Shape& sh : kShapes) golden_call(sh.name, sh.fmt, sh.rows, sh.K, false);
+        golden_call("FP4 gate+up SwiGLU", wg::Format::Nvfp4, 17408, 5120, true);
+        golden_call("FP4 head 248320x5120", wg::Format::Nvfp4, 248320, 5120, false);
+        golden_call("F8 head 248320x5120", wg::Format::F8, 248320, 5120, false);
+        golden_call("Q8 gate 17408x5120", wg::Format::Q8, 17408, 5120, false);
+        golden_call("BF16 5120x5120", wg::Format::Bf16, 5120, 5120, false);
+        return 0;
+    }
+    // --bench-one FMT ROWS K T [swiglu]: one shape at one T (for ncu); FMT f8|fp4|bf16|q8
+    if (argc > 5 && std::strcmp(argv[1], "--bench-one") == 0) {
+        const wg::Format f = !std::strcmp(argv[2], "f8") ? wg::Format::F8 : !std::strcmp(argv[2], "fp4") ? wg::Format::Nvfp4
+                           : !std::strcmp(argv[2], "q8") ? wg::Format::Q8 : wg::Format::Bf16;
+        bench_call(argv[2], f, std::atoll(argv[3]), std::atoll(argv[4]), argc > 6, {std::atoi(argv[5])});
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
-        for (const Shape& sh : kShapes) bench_call(sh.name, sh.fmt, sh.rows, sh.K, false);
-        bench_call("FP4 gate+up SwiGLU", wg::Format::Nvfp4, 17408, 5120, true);
-        bench_call("FP4 head 248320x5120", wg::Format::Nvfp4, 248320, 5120, false);
-        bench_call("F8 head 248320x5120", wg::Format::F8, 248320, 5120, false);
-        bench_call("Q8 gate 17408x5120", wg::Format::Q8, 17408, 5120, false);
+        const char* only = argc > 2 ? argv[2] : nullptr;   // a substring of the shape's name
+        auto want = [&](const char* nm) { return !only || std::strstr(nm, only); };
+        for (const Shape& sh : kShapes)
+            if (want(sh.name)) bench_call(sh.name, sh.fmt, sh.rows, sh.K, false);
+        if (want("FP4 gate+up SwiGLU")) bench_call("FP4 gate+up SwiGLU", wg::Format::Nvfp4, 17408, 5120, true);
+        if (want("FP4 head 248320x5120")) bench_call("FP4 head 248320x5120", wg::Format::Nvfp4, 248320, 5120, false);
+        if (want("F8 head 248320x5120")) bench_call("F8 head 248320x5120", wg::Format::F8, 248320, 5120, false);
+        if (want("Q8 gate 17408x5120")) bench_call("Q8 gate 17408x5120", wg::Format::Q8, 17408, 5120, false);
         return 0;
     }
     for (const Shape& sh : kShapes) parity(sh);
