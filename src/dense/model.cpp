@@ -522,7 +522,7 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
     if (o.kv_q4) {   // the 4-bit cache: head width 256 kernels, no streaming, no layer split (see HELIX-KV-Q4.md)
         const char* why = !o.kv_quant                                                   ? "an inconsistent KV format"
                           : g.head_dim != 256                                           ? "attention heads of other than 256 values"
-                          : g.n_head % g.n_kv || 96 % (g.n_head / g.n_kv)               ? "this head layout (the prompt kernel's 96-row blocks)"
+                          : g.n_head % g.n_kv                                           ? "this head layout"
                           : resident_cells(o.max_context, o.kv_resident) < o.max_context ? "K/V streaming (--kv-resident)"
                           : o.layer_begin != 0 || (o.layer_end > 0 && o.layer_end < g.n_layers) ? "a layer split over two cards"
                                                                                                 : nullptr;

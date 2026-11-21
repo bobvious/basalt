@@ -144,3 +144,90 @@ A second card in `--gpu` or `--kv-resident` makes the start FAIL with `--kv q4 d
 - `prompt_q4_kernel` needs `96 % (n_head / n_kv) == 0` (24 heads / 4 KV heads = 6, ok) and 84,480 B of dynamic shared memory (opt-in done per device/instantiation).
 - Quality unmeasured; unrotated q4 on K may be noticeably worse than int8.
 - The disk conversation tier / parking uses a new format code (3); an old image with another format is refused, a q4 image is refused by an int8 server (`other caches`).
+
+---
+
+# Round 2 (2026-11-21): the fast q4 prompt kernel
+
+Coordinator's result for round 1 (D:/llm/benchmarks/runs/basalt-kvq4-20261121/RESULTS.md): q4 works on the GPU, decode = int8, gate KLD 0.02909 / top-1 92.54%,
+but prefill at depth was far behind int8 (the fp16-tile prompt kernel above: synchronous tile loads, no key split, no double buffering).
+This round replaces that kernel. **The `prompt_q4_kernel` / `launch_prompt_q4` described in the round-1 tables no longer exists.**
+
+## What was done
+
+`prompt_i8_kernel` (gqa_attn.cu) is now templated `<W, Split, IO, Q4>`; the int8 instantiations are the old code (the int8 gate below is bit-identical to
+the published row). `Q4=true` is the int8 kernel (int8 tensor-core QK^T, u8 x s8 P V, key splitting through the same plan and merge kernel, 8- or 4-warp blocks)
+fed from the 4-bit cache:
+
+- **Tile feed.** A 64-cell key tile arrives packed by cp.async (K and V codes 8 KiB each, one buffer) with its fp16 scales (64 x 8 per tensor, double buffered).
+  At the top of the iteration the block unpacks the packed codes into the int8 tile of the int8 layout (16-byte pieces swizzled by the cell, so the int8
+  loops are unchanged): offset-binary SWAR (`q4_sx`: `((x | 0x80808080) - 0x08080808) ^ 0x80808080` = signed c - 8, no borrow between bytes), nibble
+  interleave by `__byte_perm`. Only after the unpack barrier is the next tile's copy issued into the same packed buffer, so it runs under the compute.
+- **K scales per 32 values** (the int8 kernel's are per 64): the QK^T k32 step's integer sum is scaled by its own `q_scale * k_scale` (two accumulators per 64-dim
+  group, the two scales read as one 32-bit load).
+- **V scales per 32 values, sign.** A 4-bit group's scale is negative when its largest value is positive (q4_0's `d = max / -8`), but P V rounds
+  `p * scale` to u8, which needs a non-negative scale. This was the bug in the first version of this kernel (KLD 0.53, top-1 74%): the fix is that the unpack negates
+  the codes of a negative-scale group (c -> 8 - c, branch-free: `((u ^ N) + (N & 0x01010101)) ^ 0x80808080`) and stores |d| in a `[group][cell]` buffer that P V reads
+  as two 32-bit loads. P V's per-group probability rounding now runs over 8 groups of 32 dims instead of 4 of 64.
+- 4-bit only: the two divisions per P V group use `__fdividef` (the inverse is then rounded down to fp16, so it moves a code only for a product within
+  2 ulp of a half step).
+- Shared memory: 87,040 B (8 warps) of the 101,376 B (99 KiB) a block may opt into on this card; the first attempt (102,400 B) was refused with
+  `invalid argument`, which is why the packed buffer is single and only the scales are double buffered. The opt-in error now prints the size and the CUDA error.
+- Removed: `prompt_q4_kernel`, `launch_prompt_q4`, `io_st2`, and the "96 % (n_head/n_kv) == 0" head-layout requirement in `make_model` and `gqa_prompt_attn*` for q4.
+
+## Measurement
+
+Same binary (the build at this commit), `basalt-bench`, RTX 5090 only (`CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID`, `--gpu 0`, TEMP/TMP=D:/llm/work/basalt/tmp, nothing else on GPU 0 at the start),
+order int8, q4, q4, int8. Script: `D:/llm/work/basalt/kvq4perf/kvq4-bench.cmd <fmt> <out>`:
+
+```
+bin/basalt-bench.exe --model D:/llm/models/basalt/qwen38-27b/Qwen3.8-27B-QUASAR-NVFP4.basalt -p 16384,65536,131072 --logs <dir> -- --gpu 0 --kv <fmt> --max-context 140000 --vram-reserve-mib 2048
+```
+
+Prefill t/s (engine), the two runs of each format and their mean (raw outputs: `D:/llm/work/basalt/kvq4perf/final-*.txt`):
+
+| | 16K | 64K | 128K |
+|---|--:|--:|--:|
+| int8 run 1 / run 4 | 15,620 / 15,327 | 11,442 / 11,232 | 8,217 / 8,096 |
+| **int8 mean** | **15,474** | **11,337** | **8,157** |
+| q4 run 2 / run 3 | 14,691 / 14,587 | 9,869 / 9,808 | 6,737 / 6,705 |
+| **q4 mean (after)** | **14,639 (94.6% of int8)** | **9,839 (86.8%)** | **6,721 (82.4%)** |
+| q4 before (same-session baseline, one run, round-1 kernel) | 12,111 (77.1% of that day's int8 15,701) | 5,951 (51.9% of 11,464) | 3,460 (42.1% of 8,224) |
+| q4 after / before | x1.21 | x1.65 | x1.94 |
+
+**The goal (within ~10% of int8 at 64K and 128K) is NOT met**: 64K is 13% behind, 128K 18% behind (16K is within 6%). int8's own run-to-run spread here is about 1.5-2%.
+
+## Quality gate (numerics), final binary
+
+`D:/llm/work/basalt/kvq4perf/kvq4-gate.cmd <fmt> <out>`:
+`bin/basalt-bench.exe --model <same> --quality 100 --kld-base D:/llm/models/basalt/kld-bases/qwen38-27b-bf16-base.kld -- --gpu 0 --kv <fmt> --vram-reserve-mib 2048`
+
+| run | PPL | KLD mean | median | p99 | same top-1 |
+|---|--:|--:|--:|--:|--:|
+| q4, round 1 (fp16-tile kernel; RESULTS.md) | 6.8533 | 0.02909 | 0.01351 | 0.2715 | 92.54% |
+| q4, **final kernel** | **6.8331** | **0.02871** | 0.01352 | 0.2784 | **92.47%** |
+| q4, an intermediate build (same kernel before `__fdividef` and the abs-scale buffer) | 6.8423 | 0.02907 | 0.01365 | 0.2726 | 92.19% |
+| int8, final binary | 6.8260 | 0.02585 | 0.01185 | 0.2522 | 92.89% (= the published row: the int8 path is unchanged) |
+| q4, first version of the new kernel (negative V scales unhandled) | 10.8816 | 0.53269 | 0.138 | 6.49 | 74.25% (broken, fixed above) |
+
+Required band KLD 0.0291 +/- 0.0005 and top-1 92.5 +/- 0.2: the final kernel is inside both (0.02871 is 0.0004 under the nominal; 92.47%). **The math did change in principle**
+(the old q4 kernel took fp16 queries and fp16 P V; this one rounds queries to int8 per 64 values and probabilities to u8, as the int8 kernel does), and one
+intermediate build landed 0.11 pt of top-1 below the band, so treat the two q4 kernels as the same quality only to within this gate's noise (100 chunks, one run each;
+about +/-0.0004 KLD and +/-0.3 pt top-1 between builds).
+CPU tests: `ctest -L cpu` 79/79 passed.
+
+## Where the remaining time is (measured, not guessed)
+
+Experiment (temporary, reverted): the same kernel with the unpack loops compiled out (garbage tile, same barriers and copies) gave 15,270 / 10,702 / 7,499 t/s at 16K/64K/128K,
+against 14,838 / 9,940 / 6,775 with them: **the unpack costs about 8% of total prefill at 64K and 11% at 128K**, and everything else q4 does differently (8 P V
+rounding groups instead of 4, a second scale multiply per QK^T step) costs about 5% at 64K and 8% at 128K. With the unpack free q4 would be 94.6% / 92% of int8 at 64K / 128K.
+
+The unpack is not overlapped with compute: the block unpacks, hits a barrier, then computes, with all 8 warps in the same phase, so the tensor cores idle during it. Hiding
+it needs a second int8 K/V tile (or at least V) so the next tile can be unpacked during this tile's compute. The queries (32 KiB) + one int8 K/V tile (32 KiB) + the packed
+copy (16 KiB) + the scales (4 KiB) + a second tile (32 KiB) = 116 KiB > the 99 KiB opt-in limit; without the packed staging buffer
+(unpacking from registers loaded straight from global memory) and with single-buffered scales it is exactly 101,376 B, and the kernel already uses 255 registers with small spills,
+so it lacks the register budget. Cheaper options not done: (1) change the nibble pairing to ggml's (byte j = value j | value j+16), which removes the interleave permutes
+from the unpack (about 30% fewer ops; touches the append, decode and test code); (2) apply the V sign as a nibble NOT plus a different subtract constant per group (2 ops fewer per word);
+(3) a 32-cell compute tile with double-buffered 16 KiB int8 tiles. Estimated together: +3-4% at 64K/128K, still short of 90% at 128K.
+
+Other items still slow or untested: the key-split plan (`plan_prompt_i8`) is the int8 kernel's cost model, not retuned for q4; no GPU parity test (gqa_attn_parity) was added; 4+ streams untested.
