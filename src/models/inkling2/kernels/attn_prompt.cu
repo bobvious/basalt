@@ -10,6 +10,7 @@
 // position comes from the chunk's own buffer (a full layer's cache, a sliding-window layer's stage), an earlier one from
 // the cache (a window ring or the full cache).
 #include "basalt/models/inkling2/prompt_kernels.hpp"
+#include "kv_q4.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -96,10 +97,36 @@ __device__ __forceinline__ uint32_t e4m3x2_to_h2(uint16_t u) {
 }
 
 // One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].  fp16 tiles are requested
-// (cp.async, the caller commits and waits), E4M3 tiles converted and stored before the return.
-template <bool FP8>
+// (cp.async, the caller commits and waits), E4M3 and 4-bit tiles converted (each cell's codes dequantized once into the fp16
+// tile the tensor-core products read) and stored before the return.
+template <KvFmt F>
 __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, int kvh, int64_t k0, int64_t lo, int64_t hi, int tid) {
-    if constexpr (!FP8) {
+    if constexpr (F == KvFmt::Q4) {
+        // 32 keys x 4 groups x (K, V): an item is one group's 16 code bytes (one 16 B load) and its scale, 32 halves out
+        constexpr int kItems = kKeys * kQ4Groups;
+        for (int c = tid; c < 2 * kItems; c += kThreads) {
+            const bool isv = c >= kItems;
+            const int rem = isv ? c - kItems : c;
+            const int j = rem / kQ4Groups, grp = rem % kQ4Groups;
+            const int64_t key = k0 + j;
+            const bool ok = key >= lo && key <= hi;
+            uint4 u = make_uint4(0u, 0u, 0u, 0u);
+            unsigned short sb = 0;   // a key outside [lo, hi]: zero codes, zero scale, zero halves
+            if (ok) {
+                const bool fresh = key >= a.pos0;
+                const int64_t cap = fresh ? a.chunk_cap : a.cap;
+                const uint8_t* cell = static_cast<const uint8_t*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache)) +
+                                      (size_t) (key % cap) * kQ4Cell;
+                u = *reinterpret_cast<const uint4*>(cell + kQ4CodeAt(kvh) + grp * (kQ4Group / 2));
+                sb = *reinterpret_cast<const unsigned short*>(cell + kQ4ScaleAt(kvh, grp));
+            }
+            uint32_t pv[16];
+            kvq4::pairs16(u, __half2half2(__ushort_as_half(sb)), pv);
+            uint4* dst = reinterpret_cast<uint4*>(isv ? &sm.v[j][grp * kQ4Group] : &sm.k[j][grp * kQ4Group]);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) dst[i] = make_uint4(pv[4 * i], pv[4 * i + 1], pv[4 * i + 2], pv[4 * i + 3]);
+        }
+    } else if constexpr (F == KvFmt::Fp16) {
         constexpr int kPieces = kKeys * kHeadDim / 8;   // 16-byte pieces of one tile
         for (int c = tid; c < 2 * kPieces; c += kThreads) {
             const bool isv = c >= kPieces;
@@ -142,7 +169,7 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
     }
 }
 
-template <bool FP8>
+template <KvFmt F>
 __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnPromptArgs a, const int rows, float* __restrict__ out) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
@@ -198,13 +225,13 @@ __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnProm
         __syncthreads();   // every warp is done with the previous tile
         if (!ready) {
             cur = 0;
-            load_tile<FP8>(a, sm.t0, kvh, k0, lo, hi, tid);
+            load_tile<F>(a, sm.t0, kvh, k0, lo, hi, tid);
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
         // a far tile followed by a far tile: the next one is requested into the other room before this one is used
-        const bool next = !FP8 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
+        const bool next = F == KvFmt::Fp16 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
         if (next) {
-            load_tile<FP8>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
+            load_tile<F>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
             asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
         } else {
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
@@ -356,13 +383,15 @@ void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* strea
     const dim3 grid((unsigned) ((rows + kPos - 1) / kPos), kKvHeads);
     cudaStream_t s = (cudaStream_t) stream;
     static const bool sized = [] {
-        cudaFuncSetAttribute(attn_prompt_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_prompt_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<KvFmt::Fp8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<KvFmt::Fp16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<KvFmt::Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         return true;
     }();
     (void) sized;
-    if (a.fp8) attn_prompt_kernel<true><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
-    else attn_prompt_kernel<false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    if (a.kv == KvFmt::Q4) attn_prompt_kernel<KvFmt::Q4><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    else if (a.kv == KvFmt::Fp8) attn_prompt_kernel<KvFmt::Fp8><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    else attn_prompt_kernel<KvFmt::Fp16><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
     check("attention_prompt");
 }
 
