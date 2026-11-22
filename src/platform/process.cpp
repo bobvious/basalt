@@ -204,11 +204,26 @@ bool pipe_wait_readable(int fd, int timeout_ms) {
 #if defined(_WIN32)
     const HANDLE h = (HANDLE) _get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_PIPE) return true;
-    for (int waited = 0;; waited += 10) {
+    // Helix 2026-11-21: poll every 1 ms on a high-resolution waitable timer. Sleep(10) lasts a whole 15.6 ms tick at
+    // the default timer resolution, and a command written while this waited sat there that long (3-4 per request,
+    // measured: PROMPT/PMATCH/SGEN each answered ~15 ms after the write). The timer is this thread's; no global
+    // timeBeginPeriod. Falls back to Sleep(1) where the high-resolution flag is unknown (before Windows 10 1803).
+    static thread_local HANDLE timer = [] {
+        HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                          TIMER_ALL_ACCESS);
+        return t;
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
         DWORD avail = 0;
         if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) return true;   // data, or the writer is gone
-        if (waited >= timeout_ms) return false;
-        Sleep(10);
+        if (std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(timeout_ms)) return false;
+        LARGE_INTEGER due;
+        due.QuadPart = -10000;   // 1 ms, relative, in 100 ns units
+        if (timer != nullptr && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+            WaitForSingleObject(timer, INFINITE);
+        else
+            Sleep(1);
     }
 #else
     pollfd p{fd, POLLIN, 0};

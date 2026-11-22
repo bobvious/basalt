@@ -34,6 +34,7 @@ from serve.router import Router
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
+from serve.util.trace import trace
 
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
@@ -423,6 +424,7 @@ def make_handler(target: Service | Router):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
+            trace("H", f"POST {self.path}")
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true

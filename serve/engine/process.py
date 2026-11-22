@@ -48,6 +48,7 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
 from serve.engine import lifeline, suspend
+from serve.util.trace import trace
 from serve.engine.console import LINES as CONSOLE_LINES, ConsoleLines
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, WakeBlocked, split_err
@@ -458,6 +459,7 @@ class ProcessEngine:
         line = None
         for line in proc.stdout:
             line = engine_line(line)
+            trace("<", line)
             log_unparsed(line, log)
             if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
                 continue
@@ -841,6 +843,7 @@ class ProcessEngine:
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
     def _send(self, text: str):
+        trace(">", text)
         try:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
@@ -1494,6 +1497,7 @@ class ProcessEngine:
                     body = ids.text
                     spans = ids.byte_spans()
                     plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
+                    trace(">", f"PROMPT {len(body.encode('utf-8'))}")
                     with self.wlock:
                         self.proc.stdin.write(f"PROMPT {len(body.encode('utf-8'))}{plain}\n{body}")
                         self.proc.stdin.flush()
@@ -1614,9 +1618,11 @@ class ProcessEngine:
                 spans = text.byte_spans()
                 plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
                 clip = " clip=1" if text.clip else ""
+                trace(">", f"GENT {int(max_new)}")
                 self.proc.stdin.write(f"GENT {int(max_new)}{self.sampling_keys(sampling or {})}{clip} "
                                       f"{len(body.encode('utf-8'))}{plain}\n{body}")
             else:
+                trace(">", head)
                 self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died
