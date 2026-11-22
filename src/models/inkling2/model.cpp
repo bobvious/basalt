@@ -300,7 +300,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
-        const uint64_t spare = kCardSpare + vision_room;   // [vision]
+        reserve_ = (uint64_t) std::max(req.vram_reserve_mib, 0) * kMiB;   // --vram-reserve-mib: kept free beyond the model's own spare
+        const uint64_t spare = kCardSpare + vision_room + reserve_;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
@@ -507,7 +508,7 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
     for (auto& s : sessions)
         if (model::Result r = s->prepare(); !r.ok()) return r;
     if (elastic_) {   // the caches back only their base yet: the RAM experts come back while the card has room
-        const uint64_t moved = promote(kCardSpare);
+        const uint64_t moved = promote(kCardSpare + reserve_);
         basalt::log::info("basalt inkling2", "elastic spill: %lld of %lld RAM experts copied back to the card (%.2f GiB); they go back "
                           "to RAM, the least routed first, as a conversation's caches grow",
                           (long long) n_copy_, (long long) spill_.spilled, (double) moved / (double) kGiB);

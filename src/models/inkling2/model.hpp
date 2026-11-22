@@ -90,6 +90,8 @@ public:
     /// `stream`, which is waited for before the copies are freed). Bytes freed.
     uint64_t demote(uint64_t bytes, void* stream);
     int64_t promoted() const { return n_copy_; }
+    /// --vram-reserve-mib in bytes: every grow and promote leaves it free on top of its own spare.
+    uint64_t reserve() const { return reserve_; }
     /// A prompt chunk's staging of layer l's RAM experts from their card copies, when every one has a copy (false: none
     /// issued; the caller copies them from RAM).
     bool stage_from_card(int l, void* stream) const;
@@ -132,6 +134,7 @@ private:
     uint8_t* spill_host_ = nullptr;
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none) and mapped RAM address
     bool elastic_ = false;
+    uint64_t reserve_ = 0;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     std::vector<unsigned long long> host_addr_;

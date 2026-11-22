@@ -329,8 +329,9 @@ public:
         const uint64_t grow = (uint64_t) elastic_.size() * (bytes - std::min<uint64_t>(bytes, elastic_[0]->backed())) + (64ull << 20);
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        if (free_b < grow + kElasticKeep) {
-            const uint64_t freed = m_.demote(grow + kElasticKeep - free_b, stream_);
+        const uint64_t keep_free = kElasticKeep + m_.reserve();   // --vram-reserve-mib stays free too
+        if (free_b < grow + keep_free) {
+            const uint64_t freed = m_.demote(grow + keep_free - free_b, stream_);
             basalt::log::info("basalt inkling2", "elastic spill: the caches grow to %lld positions; %.2f GiB of expert copies go back to RAM "
                               "(%lld stay on the card)", (long long) target, (double) freed / (double) (1ull << 30), (long long) m_.promoted());
         }
@@ -354,7 +355,7 @@ public:
         }
         if (m_.promoted() < m_.spill().spilled) {
             cudaStreamSynchronize(stream_);
-            m_.promote(kElasticKeep + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
+            m_.promote(kElasticKeep + m_.reserve() + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
         }
     }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem(); }
