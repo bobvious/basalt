@@ -11,7 +11,10 @@
 #include "basalt/vision/preprocess.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace basalt::dense {
@@ -21,6 +24,65 @@ using model::Result;
 using model::Status;
 
 Result fail(const std::string& m) { return {Status::Error, m}; }
+
+// BASALT_ROUND_TIMING=1 (measurement only, off by default): host wall time of a decode round's phases, solo and batch,
+// averaged and printed to stderr every 512 rounds ("RNDT" lines).  A round's period is decode entry to decode entry; a gap
+// over 100 ms (between requests) is counted, not averaged.
+using RClock = std::chrono::steady_clock;
+bool round_timing() {
+    static const bool on = std::getenv("BASALT_ROUND_TIMING") != nullptr;
+    return on;
+}
+double ms_between(RClock::time_point a, RClock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
+class RoundClock {
+public:
+    explicit RoundClock(const char* tag) : tag_(tag) {}
+    void add(const char* phase, double ms) {
+        for (int i = 0; i < kPhases; ++i) {
+            if (names_[i] == nullptr) names_[i] = phase;
+            if (names_[i] == phase) { sum_[i] += ms; cnt_[i]++; return; }
+        }
+    }
+    void round() {
+        const RClock::time_point now = RClock::now();
+        if (have_last_) {
+            const double p = ms_between(last_, now);
+            if (p > 100.0) ++gaps_;
+            else { period_ += p; ++periods_; }
+        }
+        have_last_ = true;
+        last_ = now;
+        if (++rounds_ % 512 != 0) return;
+        std::fprintf(stderr, "RNDT %s rounds=%ld period_ms=%.3f(n=%ld) gaps=%ld", tag_, rounds_, periods_ ? period_ / periods_ : 0.0, periods_, gaps_);
+        for (int i = 0; i < kPhases && names_[i]; ++i) std::fprintf(stderr, " %s=%.3f(n=%ld)", names_[i], cnt_[i] ? sum_[i] / cnt_[i] : 0.0, cnt_[i]);
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+        for (int i = 0; i < kPhases; ++i) { sum_[i] = 0; cnt_[i] = 0; }
+        period_ = 0;
+        periods_ = 0;
+        gaps_ = 0;
+    }
+private:
+    static constexpr int kPhases = 12;
+    const char* tag_;
+    const char* names_[kPhases]{};
+    double sum_[kPhases]{};
+    long cnt_[kPhases]{};
+    RClock::time_point last_{};
+    bool have_last_ = false;
+    long rounds_ = 0, periods_ = 0, gaps_ = 0;
+    double period_ = 0;
+};
+RoundClock& solo_clock() { static RoundClock c("solo"); return c; }
+RoundClock& batch_clock() { static RoundClock c("batch"); return c; }
+// adds the time from construction to destruction (or to mark()) to one phase
+struct PhaseT {
+    RoundClock& c;
+    const char* name;
+    RClock::time_point t = round_timing() ? RClock::now() : RClock::time_point{};
+    ~PhaseT() { if (round_timing()) c.add(name, ms_between(t, RClock::now())); }
+    void mark(const char* next) { if (!round_timing()) return; const auto n = RClock::now(); c.add(name, ms_between(t, n)); t = n; name = next; }
+};
 
 }  // namespace
 
@@ -218,6 +280,8 @@ public:
     // The drafter's chain after `anchor` (the token at `pos`): step 0 pairs main's last normed row (cell pos - 1) with
     // the anchor, each later step its own output with the draft before it; all on the stream, read by draft_end.
     Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        batched_ = false;
+        PhaseT pt{solo_clock(), "draft"};
         if (block_) {
             // the GDN commit runs beside the drafter (which reads none of its rows); the stream waits for it after
             // the drafter's work, so whatever comes next sees the committed state
@@ -232,7 +296,9 @@ public:
             n = wide_ ? max_window() - 1 : std::clamp(n, 1, max_window() - 1);
             const int width = block_width(n);
             if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            tev_record(0, st_.stream);
             if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
+            tev_record(1, st_.stream);
             n_draft_ = std::min(width - 1, max_window() - 1);
             return {};
         }
@@ -263,6 +329,7 @@ public:
     Result draft_batch(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n,
                        int count) override {
         if (count <= 1 || !block_ || 2 * m_.w.dflash.block > kBatch) return ModelSession::draft_batch(peers, anchors, pos, n, count);
+        PhaseT pt{batch_clock(), "dbat_settle"};
         std::vector<Session*> ss((size_t) count);
         for (int i = 0; i < count; ++i) {
             ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
@@ -284,12 +351,17 @@ public:
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
         const cudaStream_t s0 = sts[0]->stream;
+        pt.mark("dbat_launch");
+        ss[0]->tev_record(0, s0);
         for (int i = 0; i < count;) {
             int k = 0, rows = 0;
             while (i + k < count && rows + width[(size_t) (i + k)] <= kBatch) rows += width[(size_t) (i + k++)];
             if (!block_draft_batch(m_, sts.data() + i, anchors + i, pos + i, width.data() + i, k, err, s0)) return fail(err);
             i += k;
         }
+        ss[0]->tev_record(1, s0);
+        pt.mark("dbat_join");
+        for (int i = 0; i < count; ++i) ss[(size_t) i]->batched_ = true;
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
         for (int i = 0; i < count; ++i) ss[(size_t) i]->join_commit();   // the sessions' commits ran side by side
@@ -298,12 +370,14 @@ public:
     }
 
     Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
+        PhaseT pt{batched_ ? batch_clock() : solo_clock(), "dend"};
         if (block_) {
             n = std::min(n_draft_, max_n);
             if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
                 cudaMemcpyAsync(conf, st_.dconf, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
                 cudaStreamSynchronize(st_.stream) != cudaSuccess)
                 return fail(m_.o.arch + ": the block drafter failed");
+            tev_read(batched_ ? batch_clock() : solo_clock());
             return {};
         }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
@@ -325,20 +399,26 @@ public:
     Result decode_window(const model::DecodeRequest& r) override {
         if (r.n_tokens < 1 || r.n_tokens > kWindow) return fail(m_.o.arch + ": a decode window of " + std::to_string(r.n_tokens) + " rows");
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the window passes the context");
+        if (round_timing()) solo_clock().round();
+        PhaseT pt{solo_clock(), "win_settle"};
         if (Result s = settle(r.pos); !s.ok()) return s;
+        pt.mark("win_prep");
         const int T = r.n_tokens;
         int32_t pos3[kWindow * 3];
         for (int t = 0; t < T; ++t) pos3[t * 3] = pos3[t * 3 + 1] = pos3[t * 3 + 2] = (int32_t) (r.pos + t + st_.rope_delta);
         std::string err;
         if (!prepare_draw(r, err)) return fail(err);
         if (drafter_) cudaMemcpyAsync(st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, st_.stream);
+        pt.mark("win_launch");
         if (!forward_window(m_, st_, r.tokens, T, r.pos, pos3, err)) return fail(err);
+        pt.mark("win_draw");
         draw(T);
         pend_pos_ = r.pos;
         pend_T_ = T;
         if (r.logits) cudaMemcpyAsync(r.logits, st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4,
                                       cudaMemcpyDeviceToHost, st_.stream);
         cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream);
+        pt.mark("win_sync");
         if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         if (r.row_tokens) std::copy(h_picks_, h_picks_ + T, r.row_tokens);
         if (r.next_token) *r.next_token = h_picks_[T - 1];
@@ -352,6 +432,8 @@ public:
     // logits.
     Result decode_batch(model::ModelSession* const* peers, const model::DecodeRequest* reqs, int n) override {
         if (n == 1) return peers[0]->decode_window(reqs[0]);
+        if (round_timing()) batch_clock().round();
+        PhaseT pt{batch_clock(), "bat_settle"};
         std::vector<Session*> ss((size_t) n);
         std::vector<int32_t> tokens, pos3;
         std::vector<BatchSeg> segs((size_t) n);
@@ -374,6 +456,7 @@ public:
                 return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
         std::string err;
         const cudaStream_t s = ss[0]->st_.stream;
+        pt.mark("bat_prep");
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
@@ -387,7 +470,9 @@ public:
             if (se.drafter_) cudaMemcpyAsync(se.st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
             segs[(size_t) i] = {&se.st_, T, r.pos};
         }
+        pt.mark("bat_launch");
         if (!forward_batch(m_, segs.data(), n, tokens.data(), pos3.data(), err)) return fail(err);
+        pt.mark("bat_draw");
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
@@ -398,7 +483,9 @@ public:
             if (r.logits) cudaMemcpyAsync(r.logits, se.st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
             cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
         }
+        pt.mark("bat_sync");
         if (cudaStreamSynchronize(s) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        pt.mark("bat_tail");
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
@@ -767,7 +854,9 @@ private:
                 if (m.n_gdn == 0) return;
                 cudaEventRecord(s.fork, s.stream);
                 cudaStreamWaitEvent(s.side, s.fork, 0);
+                if (&s == &st_) tev_record(2, s.side);
                 commit_window(m, s, (int) n, s.side);
+                if (&s == &st_) tev_record(3, s.side);
                 cudaEventRecord(s.join, s.side);
                 commit_pending_ = true;
             };
@@ -880,6 +969,26 @@ private:
     int32_t* h_picks_ = nullptr;
     bool drafter_ = false, block_ = false;
     int n_draft_ = 0;
+    bool batched_ = false;   // the last draft was a batch's (BASALT_ROUND_TIMING)
+    // BASALT_ROUND_TIMING: GPU spans by cudaEvent, 0-1 the draft, 2-3 the commit (read once the stream that waited on them synced)
+    cudaEvent_t tev_[4]{};
+    bool tev_set_[4]{};
+    void tev_record(int i, cudaStream_t s) {
+        if (!round_timing()) return;
+        if (!tev_[i] && cudaEventCreate(&tev_[i]) != cudaSuccess) { tev_[i] = nullptr; return; }
+        cudaEventRecord(tev_[i], s);
+        tev_set_[i] = true;
+    }
+    void tev_read(RoundClock& c) {
+        if (!round_timing()) return;
+        for (int i = 0; i < 4; i += 2) {
+            if (!tev_set_[i] || !tev_set_[i + 1]) continue;
+            float ms = 0;
+            if (cudaEventSynchronize(tev_[i + 1]) == cudaSuccess && cudaEventElapsedTime(&ms, tev_[i], tev_[i + 1]) == cudaSuccess)
+                c.add(i == 0 ? "gpu_draft" : "gpu_commit", ms);
+            tev_set_[i] = tev_set_[i + 1] = false;
+        }
+    }
     cudaEvent_t done_ = nullptr;   // a batched drafter pass, for the other sessions' streams
     bool commit_pending_ = false;  // the GDN commit runs on st_.side, not yet joined to st_.stream
     bool wide_ = false;            // the last settled window kept most of a block (block - 2 rows or more)
