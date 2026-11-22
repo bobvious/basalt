@@ -10,6 +10,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "kv_q4.cuh"
 #include "prep.cuh"
 
 #include <cooperative_groups.h>
@@ -100,9 +101,10 @@ struct Smem {
     float acc[kWarps][kGroup][kHeadDim];
 };
 
-template <bool FP8>
+template <KvFmt F>
 __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int z, float* __restrict__ part_ml,
                                                                  float* __restrict__ part_acc) {
+    constexpr bool FP8 = F == KvFmt::Fp8, Q4 = F == KvFmt::Q4;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
     const int r = blockIdx.x, g = blockIdx.y, s = blockIdx.z;
@@ -114,29 +116,38 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     const int span = span_of(n);
     if (s * span >= n) return;   // past this row's slices
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
-    constexpr int kRowBytes = FP8 ? kHeadDim : kHeadDim * 2;
+    // a head's codes in a cell: kRowBytes (Q4: one 16 B piece a group, kLoads = 4; its four scales one 8 B load, kQ4ScaleAt)
+    constexpr int kRowBytes = Q4 ? kQ4HeadCodes : FP8 ? kHeadDim : kHeadDim * 2;
     constexpr int kLoads = kRowBytes / 16;
+    constexpr size_t kCellBytes = Q4 ? (size_t) kQ4Cell : (size_t) kKvHeads * kRowBytes;
     const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
     const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+    const size_t sat = (size_t) (kQ4ScaleAt(g, 0) - g * kRowBytes);   // Q4: from the head's codes to its scales
     // a tile's key and value rows, the lane's key's (zero past the slice); the warp's first tile is loaded with the queries
-    const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads]) {
+    const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads], uint2& ksc, uint2& vsc) {
         const int key = t0 + lane;
         if (key < s_hi) {
-            const size_t cell = (size_t) (key % a.cap) * kKvHeads * kRowBytes;
+            const size_t cell = (size_t) (key % a.cap) * kCellBytes;
             const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
             const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
+            if constexpr (Q4) {
+                ksc = *reinterpret_cast<const uint2*>(kbase + cell + sat);
+                vsc = *reinterpret_cast<const uint2*>(vbase + cell + sat);
+            }
         } else {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
+            ksc = vsc = make_uint2(0, 0);
         }
     };
     const int t_first = s_lo + w * kTile;
     uint4 kr[kLoads], vr[kLoads];
-    if (t_first < s_hi) load_tile(t_first, kr, vr);
+    uint2 ksc = make_uint2(0, 0), vsc = make_uint2(0, 0);
+    if (t_first < s_hi) load_tile(t_first, kr, vr, ksc, vsc);
     for (int i = threadIdx.x; i < kGroup * kHeadDim; i += blockDim.x)
         sm.q[i / kHeadDim][i % kHeadDim] = a.q[((size_t) r * kHeads + g * kGroup) * kHeadDim + i];
     for (int i = threadIdx.x; i < kGroup * kRel; i += blockDim.x)
@@ -153,12 +164,23 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     for (int t0 = t_first; t0 < s_hi; t0 += kUnit) {
         const int key = t0 + lane;
         const bool valid = key < s_hi;
-        if (t0 != t_first) load_tile(t0, kr, vr);
+        if (t0 != t_first) load_tile(t0, kr, vr, ksc, vsc);
         // the lane's key scored for the three heads
         float sc[kGroup] = {0.f, 0.f, 0.f};
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {
-            if constexpr (FP8) {
+            if constexpr (Q4) {   // group i: the three heads' dot over its 32 values of (code - 8), then its scale once
+                float f[32];
+                kvq4::codes32(kr[i], f);
+                const float ds = __half2float(kvq4::scale_of(ksc, i));
+#pragma unroll
+                for (int h = 0; h < kGroup; ++h) {
+                    float dot = 0.f;
+#pragma unroll
+                    for (int d = 0; d < 32; ++d) dot = fmaf(sm.q[h][32 * i + d], f[d], dot);
+                    sc[h] = fmaf(dot, ds, sc[h]);
+                }
+            } else if constexpr (FP8) {
                 float f[16];
                 unpack16_fp8(kr[i], f);
 #pragma unroll
@@ -187,7 +209,15 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
         }
         // the lane's value row into shared memory as fp16 pairs (E4M3 is exact in fp16)
         uint32_t* vrow = sm.v[w][lane];
-        if constexpr (FP8) {
+        if constexpr (Q4) {
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) {   // group i: its 32 values times its scale as 16 fp16 pairs
+                uint32_t pv[16];
+                kvq4::pairs16(vr[i], __half2half2(kvq4::scale_of(vsc, i)), pv);
+#pragma unroll
+                for (int k = 0; k < 16; ++k) vrow[16 * i + k] = pv[k];
+            }
+        } else if constexpr (FP8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
                 float f[16];
@@ -568,13 +598,15 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
     float* part_acc = part_ml + (size_t) rows * kHeads * z * 2;
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(attn_split_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_split_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<KvFmt::Fp16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<KvFmt::Fp8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<KvFmt::Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         attr = true;
     }
     const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
-    if (a.fp8) bk::launch_pdl(attn_split_kernel<true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
-    else bk::launch_pdl(attn_split_kernel<false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+    if (a.kv == KvFmt::Q4) bk::launch_pdl(attn_split_kernel<KvFmt::Q4>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+    else if (a.kv == KvFmt::Fp8) bk::launch_pdl(attn_split_kernel<KvFmt::Fp8>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+    else bk::launch_pdl(attn_split_kernel<KvFmt::Fp16>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     check("attention_decode");
     bk::launch_pdl(attn_combine_kernel, dim3((unsigned) rows, kHeads), dim3(kHeadDim), 0, s, a, z, (const float*) part_ml, (const float*) part_acc, out);
     check("attention_decode/combine");
@@ -582,7 +614,9 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr) {
+    // KvFmt::Q4 never runs fused: the fused kernel keeps the window's own rows in shared memory in the cache's row format, and a
+    // 4-bit row is not one head-row-sized byte range of its cell (codes and scales are apart); the three kernels read the cache
+    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.kv == KvFmt::Q4) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;
@@ -602,7 +636,7 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
-    if (a.fp8) bk::launch_pdl(attn_fused_kernel<true>, grid, dim3(kWarps * 32), smem, s, pa, a);
+    if (a.kv == KvFmt::Fp8) bk::launch_pdl(attn_fused_kernel<true>, grid, dim3(kWarps * 32), smem, s, pa, a);
     else bk::launch_pdl(attn_fused_kernel<false>, grid, dim3(kWarps * 32), smem, s, pa, a);
     check("attention_window");
 }
