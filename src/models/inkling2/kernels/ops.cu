@@ -2,6 +2,7 @@
 // (short convolutions, clips, cache writes), output gate, post-sublayer convolutions, expert plan and sum, and softcap.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "kv_q4.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -202,9 +203,16 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         const float f = which == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
         const int64_t cell = p % a.cap;
         void* cache = which ? a.v_cache : a.k_cache;
+        if (a.kv == KvFmt::Q4) {   // --kv q4: the warp's head row quantized into the cell (kv_q4.cuh)
+            float x[4];
 #pragma unroll
-        for (int u = 0; u < 4; ++u)
-            store_kv(cache, a.fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4 + u, val[u] * f);
+            for (int u = 0; u < 4; ++u) x[u] = val[u] * f;
+            kvq4::store_row(static_cast<uint8_t*>(cache) + (size_t) cell * kQ4Cell, w, lane, x);
+        } else {
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+                store_kv(cache, a.kv == KvFmt::Fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4 + u, val[u] * f);
+        }
     }
     // queries: warp w takes heads 3w .. 3w + 2
     for (int h = w * 3; h < w * 3 + 3; ++h) {
@@ -226,6 +234,14 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         if (lane < kRel) a.r[((size_t) r * kHeads + h) * kRel + lane] = rv * fr;
         if (lane == 0) a.sink[(size_t) r * kHeads + h] = yq[kOffSink + h];
     }
+}
+
+// A block per cell, a warp per key/value head: the test hook kv_q4_quantize_cells.
+__global__ void __launch_bounds__(kThreads) kv_q4_quantize_kernel(const float* __restrict__ x, uint8_t* __restrict__ cells) {
+    const int c = blockIdx.x, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float4 v = *reinterpret_cast<const float4*>(x + ((size_t) c * kKvHeads + w) * kHeadDim + lane * 4);
+    const float xs[4] = {v.x, v.y, v.z, v.w};
+    kvq4::store_row(cells + (size_t) c * kQ4Cell, w, lane, xs);
 }
 
 // The rings take the inputs of the window's last positions (after every row read the positions before the window).
@@ -453,6 +469,12 @@ void attn_prepare(const AttnPrep& a, int rows, void* stream) {
     ring_store(a.yk, (int) a.ldk, 0, kKvHeads * kHeadDim, a.pos, rows, a.k_ring, s);
     ring_store(a.yv, (int) a.ldv, 0, kKvHeads * kHeadDim, a.pos, rows, a.v_ring, s);
     check("attn_prepare/rings");
+}
+
+void kv_q4_quantize_cells(const float* x, void* cells, int n_cells, void* stream) {
+    if (n_cells <= 0) return;
+    kv_q4_quantize_kernel<<<n_cells, kThreads, 0, (cudaStream_t) stream>>>(x, static_cast<uint8_t*>(cells));
+    check("kv_q4_quantize_cells");
 }
 
 void attn_gate(const float* attn, const float* yq, int rows, float* out, void* stream) {

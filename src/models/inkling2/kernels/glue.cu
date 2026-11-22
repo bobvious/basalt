@@ -10,6 +10,7 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "kv_q4.cuh"
 #include "prep.cuh"
 
 #include <cuda_fp16.h>
@@ -426,9 +427,16 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
         float val[4], raw[4], f;
         prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f);
         void* cache = w ? a.v_cache : a.k_cache;
-        const size_t cell = ((size_t) (p % a.cap) * kKvHeads + g) * kHeadDim + lane * 4;
+        if (a.kv == KvFmt::Q4) {   // --kv q4: the warp's head row quantized into the cell (kv_q4.cuh)
+            float x[4];
 #pragma unroll
-        for (int u = 0; u < 4; ++u) prep::store_kv(cache, a.fp8, cell + u, val[u] * f);
+            for (int u = 0; u < 4; ++u) x[u] = val[u] * f;
+            kvq4::store_row(static_cast<uint8_t*>(cache) + (size_t) (p % a.cap) * kQ4Cell, g, lane, x);
+        } else {
+            const size_t cell = ((size_t) (p % a.cap) * kKvHeads + g) * kHeadDim + lane * 4;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) prep::store_kv(cache, a.kv == KvFmt::Fp8, cell + u, val[u] * f);
+        }
         float* ring = w ? a.v_ring : a.k_ring;
         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
             make_float4(raw[0], raw[1], raw[2], raw[3]);
