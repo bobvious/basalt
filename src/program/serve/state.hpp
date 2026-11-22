@@ -185,6 +185,11 @@ public:
     std::vector<ImgKey> req_imgs{};
     bool live_ok{};
     std::vector<ConvCheckpoint> checks{};
+    /// The checkpoint save in flight (see ckd_finish).  Declared after `checks`: its wait runs before their bytes are freed.
+    basalt::core::CheckpointDeferral ckd{};
+    /// A model split across two cards: the second card's part of that save, on its device.
+    basalt::core::CheckpointDeferral ckd_peer{};
+    int ckd_peer_dev = -1;
     /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
     bool touch_check(int64_t to, ConvCheckpoint::Source source);
     /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.
@@ -195,18 +200,6 @@ public:
     // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
     // and a prompt that starts with a stored conversation reads it back, after a restart too
     basalt::core::ConversationStore disk{};
-    /// The checkpoint save in flight (see ckd_finish).  Declared after `checks`, `conversations` and `disk`: its wait runs
-    /// before their bytes are freed.
-    basalt::core::CheckpointDeferral ckd{};
-    /// A model split across two cards: the second card's part of that save, on its device.
-    basalt::core::CheckpointDeferral ckd_peer{};
-    int ckd_peer_dev = -1;
-    /// The bytes of the parked conversation (in `conversations`) whose running state `ckd` is still carrying to the host
-    /// (park_current); null when none.  The request that parked it goes on with the copy under its own work: it is finished
-    /// by the next checkpoint save, the end of the request, the next request's restore, a shed, a spill or the exit.
-    const void* park_key{};
-    /// ckd_finish(), except a parked conversation's save in flight (park_key) which carries on.
-    void ckd_finish_unless_park();
     virtual int64_t disk_min_tokens() const = 0;
     static constexpr int64_t kDiskStaleTokens = 4096;   // a stored copy this close to the chain's end is kept
     static constexpr uint64_t kDiskQueueCap = 4ull << 30;   // images waiting for the writer, in RAM

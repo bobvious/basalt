@@ -18,7 +18,6 @@ void Runtime::start_guard() {
 
 void Runtime::shed_if_low() {
     if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
-    ckd_finish();   // a parked conversation's running state may still be on its way into the RAM tier that is cleared here
     const uint64_t drop = basalt::platform::ram_guard_drops();
     if (drop == shed_drop) return;
     shed_drop = drop;
@@ -44,15 +43,9 @@ void Runtime::shed_if_low() {
                       (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
 }
 
-void Runtime::ckd_finish_unless_park() {
-    if (park_key != nullptr && ckd.pending() == park_key) return;
-    ckd_finish();
-}
-
 void Runtime::ckd_finish() {
     const void* dst = ckd.pending();
     if (dst == nullptr) return;
-    if (dst == park_key) park_key = nullptr;   // landed (or failed and dropped below) either way
     std::string ce;
     bool ok = ckd.finish(ce);
     if (ckd_peer.pending()) {
@@ -63,8 +56,6 @@ void Runtime::ckd_finish() {
     basalt::log::error("basalt serve", "%s", ce.c_str());
     checks.erase(std::remove_if(checks.begin(), checks.end(),
                                 [&](const ConvCheckpoint& k) { return k.state_a.data() == dst; }), checks.end());
-    // or the save was a parked conversation's running state (park_current): that image is garbage
-    if (conversations) conversations->drop_live_state(dst);
 }
 
 bool Runtime::touch_check(int64_t to, ConvCheckpoint::Source source) {

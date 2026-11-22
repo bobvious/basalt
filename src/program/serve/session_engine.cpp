@@ -14,9 +14,6 @@
 #include "basalt/vision/ffmpeg_api.hpp"
 #include "basalt/vision/video.hpp"
 
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <iterator>
 #include <sstream>
 
@@ -264,31 +261,14 @@ public:
     /// The session's conversation as an image: its running state and its positional state by layer.  `take`, when given,
     /// is `cks` itself and gives its checkpoints to the image by move (each is ~200 MB of host bytes: copying them was
     /// ~30 ms apiece on the request's critical path); it is left empty.  The caller must not read them again.
-    /// `defer`: the running state is snapshotted on the device now and reaches the image's bytes while the caller goes on
-    /// (ckd; see save_running_deferred): those bytes are valid after ckd_finish() only, so the image must not go to a
-    /// reader (the disk tier) before it.  On a failure here the save has been finished.
     bool capture(basalt::core::SavedConversation& image, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
-                 const std::vector<ConvCheckpoint>& cks, bool cvec, std::string& e, std::vector<ConvCheckpoint>* take = nullptr,
-                 bool defer = false) {
+                 const std::vector<ConvCheckpoint>& cks, bool cvec, std::string& e, std::vector<ConvCheckpoint>* take = nullptr) {
         const int64_t positions = (int64_t) ids.size();
-        const auto t0 = std::chrono::steady_clock::now();
         image.live.ids = ids;
         image.live.imgs = imgs;
-        // Deferred: the cells first, while the link is free (their copies are synchronous and would queue behind the
-        // running state's), then the running state's snapshot, whose copy to the host goes on after this returns.
-        basalt::model::Result r;
-        if (!defer) r = save_running_now(image.live.state_a, positions);
-        const auto t1 = std::chrono::steady_clock::now();
+        basalt::model::Result r = save_running_now(image.live.state_a, positions);
         if (r.ok()) r = session().save_cells(image.kv, positions);
-        const auto t2 = std::chrono::steady_clock::now();
         if (!r.ok()) { e = r.message; return false; }
-        if (defer && !save_running_deferred(image.live.state_a, positions, e)) {
-            ckd_finish();   // a half-queued save (the second card's) must land before the bytes go
-            return false;
-        }
-        const size_t ck_n = cks.size();
-        size_t ckb = 0;
-        for (const ConvCheckpoint& c : cks) ckb += c.state_a.size();
         if (take != nullptr) {
             image.checkpoints = std::move(*take);
             take->clear();
@@ -296,14 +276,6 @@ public:
             image.checkpoints = cks;
         }
         image.cvec = cvec;
-        const auto t3 = std::chrono::steady_clock::now();
-        if (std::getenv("BASALT_PARK_TIMING")) {
-            const auto ms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
-            size_t kvb = 0;
-            for (const auto& k : image.kv) kvb += k.bytes();
-            std::fprintf(stderr, "PARKT capture positions=%lld running_ms=%.2f cells_ms=%.2f rest_ms=%.2f moved=%d defer=%d | running_bytes=%zu cells_bytes=%zu checks=%zu checks_bytes=%zu\n",
-                         (long long) positions, ms(t0, t1), ms(t1, t2), ms(t2, t3), (int) (take != nullptr), (int) defer, image.live.state_a.size(), kvb, ck_n, ckb);
-        }
         return true;
     }
     // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
@@ -327,31 +299,17 @@ public:
             basalt::log::info("basalt serve", "conversation cache: %zu tokens not parked (physical RAM admission)", live.size());
             return true;
         }
-        const auto p0 = std::chrono::steady_clock::now();
         basalt::core::SavedConversation image;
-        // `kept` == 0: the session does not go on with this conversation's checkpoints - the incoming image's replace
-        // them (adopt_checkpoints), a restore that fails or a read from token 0 clears them, a slot copy clears them first
-        // (request_restore.cpp after park_current) - so they move into the image instead of being copied.  With `kept` > 0
-        // the session rewinds to one of them: copy.
-        // The running state's copy to the host goes on while the request restores (ckd; request_restore.cpp finishes it
-        // before the request reads or moves anything).  Not for the disk tier: its writer reads the bytes at once, and
-        // with the disk on the RAM tier may spill the image straight to it.
-        const bool defer = !to_disk && !disk.enabled();
-        if (!capture(image, live, live_imgs, checks, cvec_cached, err, kept == 0 ? &checks : nullptr, defer)) return false;
-        const auto p1 = std::chrono::steady_clock::now();
-        const void* const key = image.live.state_a.data();
-        const bool put_ok = to_disk ? disk.put(std::move(image), kDiskQueueCap) : conversations->put(std::move(image), held);
-        if (defer && !put_ok) ckd_finish();   // the RAM tier refused: `image` is freed below, its bytes must have landed
-        else if (defer && ckd.pending() == key) park_key = key;   // goes on with the request; see park_key
-        const auto p2 = std::chrono::steady_clock::now();
+        // `kept` == 0: the session does not go on with this conversation's checkpoints, so they move into the image
+        // instead of being copied.  In this engine that is a request with an incoming image (adopt_checkpoints replaces
+        // `checks`; a failed restore_image clears them) or one read from token 0 (request_restore clears them after
+        // session_reset).  ckd_finish() above has landed every save into them, so no copy into a moved block is in flight.
+        // With `kept` > 0 the session rewinds to one of them: copy.
+        if (!capture(image, live, live_imgs, checks, cvec_cached, err, kept == 0 ? &checks : nullptr)) return false;
+        (void) (to_disk ? disk.put(std::move(image), kDiskQueueCap) : conversations->put(std::move(image), held));
         report_conversations();
         for (auto& s : conversations->take_spilled())
             if (!disk_has(s.live.ids, s.live.imgs, s.checkpoints, s.cvec)) disk.put(std::move(s), kDiskQueueCap);
-        if (std::getenv("BASALT_PARK_TIMING")) {
-            const auto ms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
-            std::fprintf(stderr, "PARKT park to_disk=%d capture_ms=%.2f put_ms=%.2f rest_ms=%.2f total_ms=%.2f\n", (int) to_disk, ms(p0, p1),
-                         ms(p1, p2), ms(p2, std::chrono::steady_clock::now()), ms(p0, std::chrono::steady_clock::now()));
-        }
         return true;
     }
     bool copy_from_slot(int, const ConvCheckpoint*, std::string& e) override { e = "this model's slots copy no cells"; return false; }
@@ -374,31 +332,24 @@ public:
         c.source = source;
         c.ids.assign(prompt.begin(), prompt.begin() + to);
         c.imgs = imgs_below(req_imgs, to);
-        if (!save_running_deferred(c.state_a, to, err)) return false;
-        keep_check(std::move(c));
-        return true;
-    }
-
-    /// The running state at `pos`, into `to`: snapshotted on the device now (ordered in the stream's own work, so the
-    /// request may overwrite the state at once) and moved to the host while the caller goes on (each card's part on its own
-    /// device).  `to`'s bytes are valid after ckd_finish() (ckd's one save in flight: this one finishes the one before);
-    /// they must not be read, moved to a reader or freed before it.  A save that cannot be deferred has landed on return.
-    bool save_running_deferred(basalt::core::CheckpointBytes& to, int64_t pos, std::string& e) {
         basalt::core::RunningState rs;
-        if (const basalt::model::Result r = session().running_state(pos, true, rs); !r.ok()) {
-            e = r.message;
+        if (const basalt::model::Result r = session().running_state(to, true, rs); !r.ok()) {
+            err = r.message;
             return false;
         }
-        to.resize(rs.bytes());
-        std::memcpy(to.data(), rs.head.data(), rs.head.size());
-        const std::vector<basalt::core::SaveSegment> seg{{to.data() + rs.head.size(), rs.regions}};
-        if (!ckd.save(seg, (cudaStream_t) rs.stream, to.data(), e)) return false;
+        c.state_a.resize(rs.bytes());
+        std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
+        // the state is snapshotted on the device now and moves to the host while the request goes on (each card's part on
+        // its own device)
+        const std::vector<basalt::core::SaveSegment> seg{{c.state_a.data() + rs.head.size(), rs.regions}};
+        if (!ckd.save(seg, (cudaStream_t) rs.stream, c.state_a.data(), err)) return false;
         if (!rs.peer_regions.empty()) {
             const basalt::core::OnDevice on(rs.peer_device);
             ckd_peer_dev = rs.peer_device;
-            const std::vector<basalt::core::SaveSegment> ps{{to.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
-            if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, to.data(), e)) return false;
+            const std::vector<basalt::core::SaveSegment> ps{{c.state_a.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
+            if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, c.state_a.data(), err)) return false;
         }
+        keep_check(std::move(c));
         return true;
     }
 
