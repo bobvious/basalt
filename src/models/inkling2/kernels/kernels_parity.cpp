@@ -951,6 +951,40 @@ void test_attention_window() {
         }
 }
 
+// Timing only: one decode row over a full cache at depth, per format (cells are random bytes: this measures bytes and
+// dequantization, not values; a 4-bit cell's scale halves are random too, so they may be inf/nan: nothing is checked).
+void time_attention_depth() {
+    for (const int64_t keys : {(int64_t) 16384, (int64_t) 65536, (int64_t) 188000}) {
+        for (const KvFmt fmt : {KvFmt::Fp16, KvFmt::Fp8, KvFmt::Q4}) {
+            const int64_t cap = keys + 64;
+            const size_t bytes = (size_t) cap * kv_cell_bytes(fmt);
+            std::vector<uint8_t> noise(bytes);
+            for (size_t i = 0; i < bytes; ++i) noise[i] = (uint8_t) (i * 2654435761u >> 13);
+            if (fmt == KvFmt::Fp16)   // keep the halves finite: clear the top exponent bit of each
+                for (size_t i = 1; i < bytes; i += 2) noise[i] &= 0x3F;
+            if (fmt == KvFmt::Q4)     // finite fp16 scales: every scale's high byte below 0x40
+                for (int64_t c = 0; c < cap; ++c)
+                    for (int h = 0; h < kKvHeads; ++h)
+                        for (int g = 0; g < kQ4Groups; ++g) noise[(size_t) c * kQ4Cell + (size_t) kQ4ScaleAt(h, g) + 1] &= 0x3F;
+            uint8_t* dk = dev(noise);
+            uint8_t* dv = dev(noise);
+            const int R = 1;
+            const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.8f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
+            const std::vector<float> sink = randn((size_t) R * kHeads, 2.0f), table = randn((size_t) kRel * kExtent, 0.3f);
+            std::vector<int> pos = {(int) (keys - 1)};
+            AttnArgs a;
+            a.q = dev(q); a.r = dev(rs); a.sink = dev(sink); a.rel_table = dev(table); a.pos = dev(pos);
+            a.k_cache = dk; a.v_cache = dv; a.cap = cap; a.kv = fmt;
+            float* out = zeros<float>((size_t) R * kHeads * kHeadDim);
+            void* scr = zeros<uint8_t>(attention_decode_scratch(R, keys));
+            const double us = time_us([&] { attention_decode(a, R, keys, scr, out, nullptr); }, 20);
+            std::printf("  decode, 1 row at depth %6lld, %-5s %8.1f us  (%.0f GB/s of K and V)\n", (long long) keys,
+                        fmt == KvFmt::Q4 ? "q4" : fmt == KvFmt::Fp8 ? "fp8" : "fp16", us, (double) keys * (double) kv_cell_bytes(fmt) * 2 / us / 1e3);
+            cudaFree(dk); cudaFree(dv);
+        }
+    }
+}
+
 // The cache writers' quantizer (kv_q4.cuh through the test hook) against the host reference q4_quantize_group + q4_pack: every byte
 // of 2,000 cells of random values, plus cells of the group shapes the rules single out. Bitwise.
 void test_kv_q4_quantizer() {
@@ -1116,6 +1150,7 @@ int main() {
     test_decode_prepare();
     test_attention_window();
     test_kv_q4_quantizer();
+    time_attention_depth();
     test_post_attn();
     test_expert_prefetch();
     test_moe_finish();
