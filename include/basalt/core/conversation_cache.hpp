@@ -481,6 +481,19 @@ public:
         return freed;
     }
 
+    /// Drops the parked conversation whose live running state is the bytes at `state` (a deferred save into them failed:
+    /// the image is garbage).  False when there is none.
+    bool drop_live_state(const void* state) {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].live.state_a.data() != state) continue;
+            SavedConversation gone = std::move(entries_[i]);
+            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+            forget(gone);
+            return true;
+        }
+        return false;
+    }
+
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first

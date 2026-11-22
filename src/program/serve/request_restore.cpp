@@ -4,6 +4,12 @@
 
 namespace basalt::program::serve {
 
+// BASALT_PARK_TIMING=1: where a request's restore spends its time (stderr, one line per mark)
+static void park_mark(const char* what, Clock::time_point since) {
+    static const bool on = std::getenv("BASALT_PARK_TIMING") != nullptr;
+    if (on) std::fprintf(stderr, "PARKT restore +%.2f ms %s\n", std::chrono::duration<double, std::milli>(Clock::now() - since).count(), what);
+}
+
 // ---- where this request starts reading: the live session, or a checkpoint, whose tokens and pictures are
 // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
 bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) {
@@ -265,6 +271,7 @@ Flow Request::restore() {
     }
     // Reject the entire image before parking/overwriting the outgoing
     // state. Invalid entries can safely fall back to its existing prefix.
+    park_mark("before park", r0);
     validate_incoming();
     // Preserve the outgoing branch before any checkpoint rewind, reset,
     // or incoming restore overwrites the positional state it requires.
@@ -274,6 +281,7 @@ Flow Request::restore() {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    park_mark("after park", r0);
     if (slot_source >= 0) {
         const auto t0 = Clock::now();
         if (!runtime_.copy_from_slot(slot_source, slot_ck, runtime_.err)) {
@@ -334,7 +342,9 @@ Flow Request::restore() {
                      runtime_.conversations->size(), runtime_.conversations->bytes());
         runtime_.report_conversations((long long) resume, restore_ms);
     }
-    runtime_.ckd_finish();
+    park_mark("before finish", r0);
+    runtime_.ckd_finish_unless_park();   // a save the park left in flight goes on under this request's work
+    park_mark("after finish", r0);
     if (want_cvec != runtime_.cvec_cached) {
         runtime_.live_ok = false;
         runtime_.checks.clear();
@@ -374,6 +384,7 @@ Flow Request::restore() {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
     }
+    park_mark("end", r0);
     std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
     basalt::core::progress_at("reading the prompt, from token", read_from);
     std::fflush(stdout);

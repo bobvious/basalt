@@ -485,5 +485,19 @@ int main() {
             check(conversation_prefix(c, exact, {}) == 0, "a prompt as long as the key cannot consume its last token");
         }
     }
+    {   // a parked conversation whose deferred running-state save failed leaves the cache by its bytes (Runtime::ckd_finish)
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation a = image({1, 2, 3}), b = image({4, 5, 6});
+        const void* ka = a.live.state_a.data();
+        const void* kb = b.live.state_a.data();
+        check(ka != kb && cache.put(std::move(a)) && cache.put(std::move(b)) && cache.size() == 2, "two parked conversations");
+        const size_t both = cache.bytes();
+        check(cache.drop_live_state(ka), "the conversation with those bytes is dropped");
+        check(cache.size() == 1 && cache.bytes() < both && cache.bytes() == image({4, 5, 6}).bytes(), "its bytes leave the accounting");
+        const std::vector<int32_t> prompt{4, 5, 6, 7};
+        check(cache.best(prompt, {}, true).tokens == 3, "the other conversation is still matched");
+        check(!cache.drop_live_state(ka) && !cache.drop_live_state(nullptr) && cache.size() == 1, "unknown bytes drop nothing");
+        check(cache.drop_live_state(kb) && cache.size() == 0 && cache.bytes() == 0, "the last one leaves an empty cache");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
