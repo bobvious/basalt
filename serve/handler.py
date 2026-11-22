@@ -424,9 +424,9 @@ def make_handler(target: Service | Router):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
-            trace("H", f"POST {self.path}")
             if not self._authorized():
                 return
+            trace("H", f"POST {self.path}")
             path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
