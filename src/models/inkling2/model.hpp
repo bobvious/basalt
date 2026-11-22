@@ -5,6 +5,7 @@
 
 #include "basalt/model/adapter.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
+#include "basalt/models/inkling2/kernels.hpp"   // KvFmt
 #include "models/inkling2/pack.hpp"
 #include "models/inkling2/spill.hpp"
 #include "models/inkling2/vision_encoder.hpp"   // [vision]
@@ -69,7 +70,9 @@ public:
     int device() const { return device_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
-    bool cache_fp8() const { return fp8_; }
+    /// --kv: the full-attention visits' cache format; the sliding-window rings take ring_fmt() of it (Q4 keeps them fp8).
+    KvFmt cache_fmt() const { return kv_; }
+    KvFmt visit_fmt(bool ring) const { return ring ? ring_fmt(kv_) : kv_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
     ImageEncoder& encoder() const { return vis_; }
     const DsparkWeights* dspark() const { return dspark_.get(); }   // DSPARK HOOK: null without a drafter or with --spec 1
@@ -118,7 +121,7 @@ private:
     float* msg_queries_ = nullptr;
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
-    bool fp8_ = false;
+    KvFmt kv_ = KvFmt::Fp16;
     int64_t ctx_ = kDefaultContext;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
@@ -145,7 +148,8 @@ private:
 /// A session over `model`; null with `err` set.
 std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::string& err);
 
-/// The device bytes a session takes for `context` positions (fp8: one byte a cached value).
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8);
+/// The device bytes a session takes for `context` positions (kv_cell_bytes: fp16 2,048 B a cell, fp8 1,024, q4 576; the rings
+/// of a q4 session are fp8).
+uint64_t session_bytes(const Geometry& g, int64_t context, KvFmt kv);
 
 }  // namespace basalt::models::inkling2

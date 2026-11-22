@@ -20,13 +20,13 @@ struct AttnPromptArgs {
     const float* sink = nullptr;       ///< [rows][kHeads]
     const float* rel_table = nullptr;  ///< [kRel][kExtent]: bias(d) = r . table[:, d] for 0 <= d < kExtent
     int64_t pos0 = 0;                  ///< row i at position pos0 + i
-    const void* k_cache = nullptr;     ///< keys before pos0: [cap][kKvHeads][kHeadDim], position p in cell p % cap
+    const void* k_cache = nullptr;     ///< keys before pos0: cap cells (KvFmt), position p in cell p % cap
     const void* v_cache = nullptr;
     int64_t cap = 0;
-    const void* k_chunk = nullptr;     ///< keys from pos0 on: [chunk_cap][kKvHeads][kHeadDim], position p in cell p % chunk_cap
+    const void* k_chunk = nullptr;     ///< keys from pos0 on: chunk_cap cells, position p in cell p % chunk_cap
     const void* v_chunk = nullptr;     ///< (a full layer passes its cache again; a sliding-window layer the chunk's stage)
     int64_t chunk_cap = 0;
-    bool fp8 = false;                  ///< unit-scale E4M3 codes instead of fp16
+    KvFmt kv = KvFmt::Fp16;            ///< the cells' format (the cache's and the chunk's are one format)
     int window = 0;                    ///< > 0: keys at distance < window only
     float scale = 0.08838834764831845f;
 };

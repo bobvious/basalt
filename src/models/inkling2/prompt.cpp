@@ -337,7 +337,7 @@ private:
         if (!one) quant(b_.nrm + 2 * RE, E, rows, 8);
         product(w.proj + (size_t) kRowV * row_bytes, kProjKV, E, rows, b_.yv);
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
-        const bool fp8 = m_.cache_fp8();
+        const KvFmt kvf = m_.visit_fmt(c.ring);   // a ring (and its stage) is fp8 under --kv q4
         AttnPrep ap;
         ap.yq = b_.yq;
         ap.yk = b_.yk;
@@ -358,7 +358,7 @@ private:
         ap.k_cache = c.ring ? b_.k_stage : c.k;
         ap.v_cache = c.ring ? b_.v_stage : c.v;
         ap.cap = c.ring ? kChunk : c.cap;
-        ap.fp8 = fp8;
+        ap.kv = kvf;
         ap.q = b_.q;
         ap.r = b_.r;
         ap.sink = b_.sink;
@@ -375,11 +375,11 @@ private:
         aa.k_chunk = ap.k_cache;
         aa.v_chunk = ap.v_cache;
         aa.chunk_cap = ap.cap;
-        aa.fp8 = fp8;
+        aa.kv = kvf;
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b_.attn, stream_);
-        if (c.ring) stage_to_ring(b_.k_stage, b_.v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, fp8 ? 1 : 2, stream_);
+        if (c.ring) stage_to_ring(b_.k_stage, b_.v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window, kvf == KvFmt::Fp8 ? 1 : 2, stream_);
         attn_gate(b_.attn, b_.yq, rows, b_.q, stream_);   // the queries are spent: the gated rows go there
         quant(b_.q, kOut, rows, 8);
         product(w.out, E, kOut, rows, b_.o);

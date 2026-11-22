@@ -36,7 +36,7 @@ public:
     int max_expert_cards() const override { return 0; }
     const char* model_name() const override { return "Inkling-2-Mini"; }
 
-    // --kv: the attention caches as fp16 (the default) or fp8; --spec, --draft-log: the drafter's windows
+    // --kv: the attention caches as fp16 (the default), fp8 or q4; --spec, --draft-log: the drafter's windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
@@ -46,8 +46,8 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8") {
-            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default) or fp8", o.kv.c_str());
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "q4") {
+            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8 or q4", o.kv.c_str());
             return 2;
         }
         dspark_finish_flags(o);   // DSPARK HOOK

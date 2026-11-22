@@ -58,14 +58,11 @@ uint64_t expert_stride(int type, uint64_t blob) {
 }
 }  // namespace
 
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8) {
+uint64_t session_bytes(const Geometry& g, int64_t context, KvFmt kv) {
     int global = 0, swa = 0;
     for (const Visit& v : g.visits) (g.swa[(size_t) v.layer] ? swa : global) += 1;
-    const uint64_t elem = fp8 ? 1 : 2;
-    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
-    const uint64_t ring = (uint64_t) g.window + kDecodeRows;
-    return (uint64_t) global * per_pos * (uint64_t) context + (uint64_t) swa * per_pos * ring + kSessionFixed +
-           prompt_bytes(g);   // PROMPT HOOK
+    const int64_t ring = (int64_t) g.window + kDecodeRows;
+    return kv_cache_bytes(global, swa, context, ring, kv) + kSessionFixed + prompt_bytes(g);   // PROMPT HOOK
 }
 
 InklingModel::InklingModel() = default;
@@ -281,7 +278,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         w.blob_bytes = el.blob_bytes;
         w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
     }
-    fp8_ = req.kv == "fp8";
+    kv_ = req.kv == "q4" ? KvFmt::Q4 : req.kv == "fp8" ? KvFmt::Fp8 : KvFmt::Fp16;
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
     if (req.spec >= 2)
         if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
@@ -304,7 +301,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = kCardSpare + vision_room + reserve_;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
+            return session_bytes(g, c, kv_) + (dspark_ ? dspark_session_bytes(pack_, c, std::max(kDecodeRows, kPromptChunk)) : 0);
         };
         // the experts: all on the card when they fit beside the asked context; else the least routed go to RAM, just enough
         // (spill.hpp). --expert-cache N keeps at most N on the card (a diagnostic).
@@ -361,7 +358,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
             return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
                                               std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
-                                              " positions fit" + (fp8_ ? "" : " (--kv fp8 halves a position's bytes)")};
+                                              " positions fit" +
+                                              (kv_ == KvFmt::Q4 ? "" : kv_ == KvFmt::Fp8 ? " (--kv q4 takes 9/16 of fp8's bytes)"
+                                                                      : " (--kv fp8 halves a position's bytes, --kv q4 takes 9/32)")};
         }
         ctx_ = want;
     }

@@ -10,6 +10,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(__CUDACC__)
+#define INKLING2_HD __host__ __device__
+#else
+#define INKLING2_HD
+#endif
+
 namespace basalt::models::inkling2 {
 
 constexpr int kWidth = 2304;        ///< the hidden width the kernels are built for
@@ -23,6 +29,38 @@ constexpr int kConvRing = 16;       ///< positions a convolution ring keeps: a w
 constexpr int kMaxMix = 6;          ///< states one mix reads: the finished blocks and the partial
 constexpr int kDecodeRows = 8;      ///< rows of a decode window's fused kernels (the products take 8 columns at most)
 constexpr int kMaxStreams = 4;      ///< loop controllers one call runs side by side
+
+// ---- the K/V cache's cell formats ---------------------------------------------------------------------------------------------
+
+/// How a visit's keys (and, the same way, its values) are stored. A CELL is one position of one visit's K, or of its V, with
+/// every key/value head:
+///   Fp16  kKvHeads x kHeadDim halves, 2,048 B
+///   Fp8   the same as unit-scale E4M3 codes, 1,024 B
+///   Q4    4-bit codes with an fp16 scale per 32 values (the 27B stack's q4_0 style, dense/kv_format.hpp), 576 B: the codes of
+///         every head first, [kKvHeads][kHeadDim / 2] bytes (byte j of a head = value 2j in its low nibble, 2j + 1 in its high
+///         one), then the scales, [kKvHeads][kHeadDim / 32] halves.
+/// Q4 is for the full-attention visits' caches only (--kv q4); the sliding-window rings stay Fp8.
+enum class KvFmt : int { Fp16 = 0, Fp8 = 1, Q4 = 2 };
+
+constexpr int kQ4Group = 32;                                  ///< values per scale
+constexpr int kQ4Groups = kHeadDim / kQ4Group;                ///< scales a head row
+constexpr int kQ4HeadCodes = kHeadDim / 2;                    ///< code bytes a head row
+constexpr int kQ4ScalesAt = kKvHeads * kQ4HeadCodes;          ///< byte offset of the scales in a cell
+constexpr int kQ4Cell = kQ4ScalesAt + kKvHeads * kQ4Groups * 2;   ///< 576
+INKLING2_HD constexpr int kQ4CodeAt(int head) { return head * kQ4HeadCodes; }                  ///< head's codes in a cell (bytes)
+INKLING2_HD constexpr int kQ4ScaleAt(int head, int group) { return kQ4ScalesAt + (head * kQ4Groups + group) * 2; }   ///< a scale (bytes)
+
+/// Bytes of one cell (K or V) in a format.
+INKLING2_HD constexpr uint64_t kv_cell_bytes(KvFmt f) {
+    return f == KvFmt::Q4 ? (uint64_t) kQ4Cell : (uint64_t) kKvHeads * kHeadDim * (f == KvFmt::Fp8 ? 1 : 2);
+}
+/// The format a sliding-window ring takes under a cache format: Q4 caches keep their rings in Fp8.
+INKLING2_HD constexpr KvFmt ring_fmt(KvFmt f) { return f == KvFmt::Q4 ? KvFmt::Fp8 : f; }
+/// Device bytes of the K/V caches (keys and values) of `global` full-attention and `swa` sliding-window visits holding
+/// `context` positions and rings of `ring_cells` cells.
+INKLING2_HD constexpr uint64_t kv_cache_bytes(int global, int swa, int64_t context, int64_t ring_cells, KvFmt f) {
+    return 2ull * ((uint64_t) global * kv_cell_bytes(f) * (uint64_t) context + (uint64_t) swa * kv_cell_bytes(ring_fmt(f)) * (uint64_t) ring_cells);
+}
 
 /// A layer's fused projection rows, in this order: q, r, gate, sink (read from the query input), k and the key
 /// convolution's per-token taps (from the key input), v and its taps (from the value input). A sliding-window layer has no
@@ -70,14 +108,17 @@ struct AttnPrep {
     float log_floor = 8192.f, log_alpha = 0.1f;
     float* k_ring = nullptr;           ///< the convolution inputs of the last kConvRing positions [kConvRing][1024], slot pos % kConvRing
     float* v_ring = nullptr;
-    void* k_cache = nullptr;           ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16 or E4M3 (fp8 set)
+    void* k_cache = nullptr;           ///< cap cells (KvFmt above), position p in cell p % cap
     void* v_cache = nullptr;
     int64_t cap = 0;
-    bool fp8 = false;                  ///< unit-scale E4M3 codes (keys are clipped and values normed, so they fit)
+    KvFmt kv = KvFmt::Fp16;            ///< the cache's cell format (Fp8: unit-scale E4M3, keys are clipped and values normed, so they fit)
     float* q = nullptr;                ///< out: the clipped (and scaled) queries [rows][kHeads][kHeadDim]
     float* r = nullptr;                ///< out: the relative states [rows][kHeads][kRel]
     float* sink = nullptr;             ///< out: [rows][kHeads]
 };
+/// Test hook: `n_cells` cells of [kKvHeads][kHeadDim] fp32 values quantized into KvFmt::Q4 cells (kQ4Cell bytes each) by the
+/// quantizer the cache writers use (kernels/kv_q4.cuh), so a parity test can hold it bitwise to the host reference.
+void kv_q4_quantize_cells(const float* x, void* cells, int n_cells, void* stream);
 /// Convolves the window's keys and values (positions before the window read from the rings, below position 0 zero),
 /// clips the keys, norms the values, writes both to the cache, and prepares q, r and the sinks. Then the rings take the
 /// window's convolution inputs. `rows` <= 8 in a decode window; a prompt chunk passes up to its whole length.
@@ -93,7 +134,7 @@ struct AttnArgs {
     const void* k_cache = nullptr;
     const void* v_cache = nullptr;
     int64_t cap = 0;                   ///< the cache's cells (a ring when window is set)
-    bool fp8 = false;
+    KvFmt kv = KvFmt::Fp16;            ///< the cache's cell format
     int window = 0;                    ///< > 0: keys at distance < window only (the cache is then a ring of cap >= window + rows)
     float scale = 0.08838834764831845f;
     const float* gate = nullptr;       ///< set: the output is gated by sigmoid(gate[r * gate_ld + h * kHeadDim + d])
