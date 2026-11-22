@@ -206,28 +206,18 @@ bool pipe_wait_readable(int fd, int timeout_ms) {
     if (h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_PIPE) return true;
     // Helix 2026-11-21: Sleep(10) lasts a whole 15.6 ms tick at the default timer resolution, and a command written
     // while this waited sat there that long (3-4 per request: PROMPT/PMATCH/SGEN each answered ~15 ms after the
-    // write). For kActiveMs after the last data this polls every 1 ms on a high-resolution waitable timer (this
-    // thread's; no global timeBeginPeriod), then falls back to the old Sleep(10) so an idle engine does not wake
-    // 1000 times a second: a request after an idle spell pays at most one tick on its first command, not on each.
+    // write). This polls every 1 ms on a high-resolution waitable timer (this thread's; no global timeBeginPeriod).
+    // Always: an idle back-off would put the tick back on the FIRST command of every request after a quiet spell (most
+    // interactive requests), and the 1 ms poll's idle cost was measured negligible (idlecpu.log in the Helix run dir).
     // A negative timeout waits for data indefinitely, as before (and as poll(-1)). Where the high-resolution timer
     // is unavailable (before Windows 10 1803) Sleep(1) is used, which is again one tick.
-    constexpr int kActiveMs = 1000;
     static thread_local HANDLE timer = CreateWaitableTimerExW(
         nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_MODIFY_STATE | SYNCHRONIZE);
-    static thread_local std::chrono::steady_clock::time_point last_data{};
     const auto t0 = std::chrono::steady_clock::now();
     for (;;) {
         DWORD avail = 0;
-        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) {   // data, or the writer is gone
-            last_data = std::chrono::steady_clock::now();
-            return true;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (timeout_ms >= 0 && now - t0 >= std::chrono::milliseconds(timeout_ms)) return false;
-        if (now - last_data >= std::chrono::milliseconds(kActiveMs)) {
-            Sleep(10);
-            continue;
-        }
+        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) return true;   // data, or the writer is gone
+        if (timeout_ms >= 0 && std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(timeout_ms)) return false;
         LARGE_INTEGER due;
         due.QuadPart = -10000;   // 1 ms, relative, in 100 ns units
         if (timer != nullptr && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
