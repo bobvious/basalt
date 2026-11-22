@@ -12,6 +12,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/kv_q4.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -113,21 +114,53 @@ double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
 // ---- attention -----------------------------------------------------------------------------------------------------------
 
-// A cache of `cap` cells ([cell][kKvHeads][kHeadDim]) holding positions [lo, hi) in cell p % cap: a value per (head,
-// position, dim), the same at every place a position is stored. fp16 codes, or E4M3 codes.
+// A cache of `cap` cells holding positions [lo, hi) in cell p % cap: a value per (head, position, dim), the same at every place
+// a position is stored. fp16 codes, E4M3 codes ([cell][kKvHeads][kHeadDim]) or 4-bit cells (KvFmt::Q4: kQ4Cell bytes a cell).
 struct KeyBank {
     std::vector<float> k, v;   // [kKvHeads][positions][kHeadDim] for positions [0, hi)
+    std::vector<uint8_t> qk, qv;   // the 4-bit cell of every position [hi][kQ4Cell], of the keys and of the values
+    std::vector<float> dk, dv;     // what those cells decode to, laid out like k and v
     int64_t hi = 0;
     void make(int64_t n) {
         hi = n;
         k = randn((size_t) kKvHeads * n * kHeadDim, 0.6f);
         v = randn((size_t) kKvHeads * n * kHeadDim, 1.0f);
+        qk.assign((size_t) n * kQ4Cell, 0);
+        qv.assign((size_t) n * kQ4Cell, 0);
+        dk.assign(k.size(), 0.f);
+        dv.assign(v.size(), 0.f);
+        std::vector<float> x(kKvHeads * kHeadDim), y(kKvHeads * kHeadDim);
+        for (int w = 0; w < 2; ++w)
+            for (int64_t p = 0; p < n; ++p) {
+                const std::vector<float>& src = w ? v : k;
+                for (int h = 0; h < kKvHeads; ++h)
+                    for (int d = 0; d < kHeadDim; ++d) x[(size_t) h * kHeadDim + d] = src[((size_t) h * n + p) * kHeadDim + d];
+                uint8_t* cell = &(w ? qv : qk)[(size_t) p * kQ4Cell];
+                kv_q4_put_cell(cell, x.data());
+                kv_q4_get_cell(cell, y.data());
+                for (int h = 0; h < kKvHeads; ++h)
+                    for (int d = 0; d < kHeadDim; ++d) (w ? dv : dk)[((size_t) h * n + p) * kHeadDim + d] = y[(size_t) h * kHeadDim + d];
+            }
     }
-    double key(bool fp8, int h, int64_t p, int d) const { return round(fp8, k[((size_t) h * hi + p) * kHeadDim + d]); }
-    double val(bool fp8, int h, int64_t p, int d) const { return round(fp8, v[((size_t) h * hi + p) * kHeadDim + d]); }
-    static double round(bool fp8, float x) { return fp8 ? e42d(f2e4(x)) : h2d(f2h(x)); }
+    // the values the kernels' products see: fp16 and E4M3 are rounded as stored; a 4-bit value is the exact (code - 8) d, which
+    // the prompt kernel then rounds to fp16 on the way into its tiles
+    double key(KvFmt f, int h, int64_t p, int d) const {
+        const size_t i = ((size_t) h * hi + p) * kHeadDim + d;
+        return f == KvFmt::Q4 ? round(KvFmt::Fp16, dk[i]) : round(f, k[i]);
+    }
+    double val(KvFmt f, int h, int64_t p, int d) const {
+        const size_t i = ((size_t) h * hi + p) * kHeadDim + d;
+        return f == KvFmt::Q4 ? round(KvFmt::Fp16, dv[i]) : round(f, v[i]);
+    }
+    static double round(KvFmt f, float x) { return f == KvFmt::Fp8 ? e42d(f2e4(x)) : h2d(f2h(x)); }
     // the cache bytes of positions [lo, hi2) at p % cap
-    std::vector<uint8_t> cache(bool fp8, bool keys, int64_t cap, int64_t lo, int64_t hi2) const {
+    std::vector<uint8_t> cache(KvFmt f, bool keys, int64_t cap, int64_t lo, int64_t hi2) const {
+        if (f == KvFmt::Q4) {
+            std::vector<uint8_t> out((size_t) cap * kQ4Cell, 0);
+            for (int64_t p = lo; p < hi2; ++p) std::memcpy(&out[(size_t) (p % cap) * kQ4Cell], &(keys ? qk : qv)[(size_t) p * kQ4Cell], kQ4Cell);
+            return out;
+        }
+        const bool fp8 = f == KvFmt::Fp8;
         const size_t el = fp8 ? 1 : 2;
         std::vector<uint8_t> out((size_t) kKvHeads * cap * kHeadDim * el, 0);
         const std::vector<float>& src = keys ? k : v;
@@ -148,7 +181,7 @@ struct KeyBank {
 };
 
 void test_attention_prompt() {
-    for (const bool fp8 : {false, true})
+    for (const KvFmt fmt : {KvFmt::Fp16, KvFmt::Fp8, KvFmt::Q4})
         for (const bool window : {true, false}) {
             const int R = 300;
             const int64_t pos0 = window ? 2500 : 3000;
@@ -161,13 +194,13 @@ void test_attention_prompt() {
             const int64_t ring_cap = kExtent + 64, stage_cap = 512, full_cap = 4096;
             std::vector<uint8_t> kc, vc, ks, vs;
             if (window) {
-                kc = kb.cache(fp8, true, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
-                vc = kb.cache(fp8, false, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
-                ks = kb.cache(fp8, true, stage_cap, pos0, pos0 + R);
-                vs = kb.cache(fp8, false, stage_cap, pos0, pos0 + R);
+                kc = kb.cache(fmt, true, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
+                vc = kb.cache(fmt, false, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
+                ks = kb.cache(fmt, true, stage_cap, pos0, pos0 + R);
+                vs = kb.cache(fmt, false, stage_cap, pos0, pos0 + R);
             } else {
-                kc = kb.cache(fp8, true, full_cap, 0, pos0 + R);
-                vc = kb.cache(fp8, false, full_cap, 0, pos0 + R);
+                kc = kb.cache(fmt, true, full_cap, 0, pos0 + R);
+                vc = kb.cache(fmt, false, full_cap, 0, pos0 + R);
             }
             uint8_t *dkc = dev(kc), *dvc = dev(vc), *dks = window ? dev(ks) : dkc, *dvs = window ? dev(vs) : dvc;
             float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table);
@@ -184,7 +217,7 @@ void test_attention_prompt() {
             a.k_chunk = dks;
             a.v_chunk = dvs;
             a.chunk_cap = window ? stage_cap : full_cap;
-            a.fp8 = fp8;
+            a.kv = fmt;
             a.window = window ? kExtent : 0;
             attention_prompt(a, R, out, S);
             const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
@@ -199,7 +232,7 @@ void test_attention_prompt() {
                     double m = sink[(size_t) r * kHeads + h];
                     for (int64_t key = lo; key <= p; ++key) {
                         double d = 0;
-                        for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kb.key(fp8, g, key, i);
+                        for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kb.key(fmt, g, key, i);
                         d *= a.scale;
                         const int64_t dist = p - key;
                         if (dist < kExtent)
@@ -211,13 +244,13 @@ void test_attention_prompt() {
                     for (double& s : sc) den += (s = std::exp(s - m));
                     for (int i = 0; i < kHeadDim; ++i) {
                         double acc = 0;
-                        for (int64_t key = lo; key <= p; ++key) acc += sc[(size_t) (key - lo)] * kb.val(fp8, g, key, i);
+                        for (int64_t key = lo; key <= p; ++key) acc += sc[(size_t) (key - lo)] * kb.val(fmt, g, key, i);
                         ref.push_back(acc / den);
                         gsub.push_back(got[((size_t) r * kHeads + h) * kHeadDim + i]);
                     }
                 }
             char name[96];
-            std::snprintf(name, sizeof name, "attention_prompt %s %s vs CPU", window ? "window" : "full", fp8 ? "e4m3" : "fp16");
+            std::snprintf(name, sizeof name, "attention_prompt %s %s vs CPU", window ? "window" : "full", fmt == KvFmt::Fp8 ? "e4m3" : fmt == KvFmt::Q4 ? "q4" : "fp16");
             report(name, gsub, ref, 4e-3);
             {   // the output's hash: a change meant to keep the bits keeps it
                 uint64_t h = 1469598103934665603ull;
@@ -228,8 +261,8 @@ void test_attention_prompt() {
             // the decode kernel on the same rows, over one cache that holds every position
             {
                 const int64_t cap = window ? kExtent + R + 8 : full_cap;
-                std::vector<uint8_t> dk = kb.cache(fp8, true, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
-                std::vector<uint8_t> dv = kb.cache(fp8, false, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
+                std::vector<uint8_t> dk = kb.cache(fmt, true, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
+                std::vector<uint8_t> dv = kb.cache(fmt, false, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
                 uint8_t *ddk = dev(dk), *ddv = dev(dv);
                 std::vector<int32_t> pos(R);
                 for (int r = 0; r < R; ++r) pos[r] = (int32_t) (pos0 + r);
@@ -243,7 +276,7 @@ void test_attention_prompt() {
                 d.k_cache = ddk;
                 d.v_cache = ddv;
                 d.cap = cap;
-                d.fp8 = fp8;
+                d.kv = fmt;
                 d.window = a.window;
                 const int64_t max_keys = window ? kExtent : pos0 + R;
                 void* scr = zeros<uint8_t>(attention_decode_scratch(8, max_keys));

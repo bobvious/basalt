@@ -9,6 +9,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/kv_q4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -88,6 +89,23 @@ double h2d(uint16_t h) {
     return (double) __half2float(__half(r));
 }
 uint16_t f2h(float f) { return __half_raw(__float2half(f)).x; }
+// A --kv q4 cache of `cap` cells of random values: the cells' bytes (host reference quantizer) and the values they decode to,
+// laid out [cell][kKvHeads][kHeadDim] like the fp16 cache's elements.
+struct Q4Cache {
+    std::vector<uint8_t> bytes;
+    std::vector<float> vals;
+};
+Q4Cache make_q4_cache(int64_t cap, float sd) {
+    Q4Cache c;
+    c.bytes.assign((size_t) cap * kQ4Cell, 0);
+    c.vals.assign((size_t) cap * kKvHeads * kHeadDim, 0.f);
+    for (int64_t cell = 0; cell < cap; ++cell) {
+        const std::vector<float> x = randn((size_t) kKvHeads * kHeadDim, sd);
+        kv_q4_put_cell(&c.bytes[(size_t) cell * kQ4Cell], x.data());
+        kv_q4_get_cell(&c.bytes[(size_t) cell * kQ4Cell], &c.vals[(size_t) cell * kKvHeads * kHeadDim]);
+    }
+    return c;
+}
 double tanhd(double x) { return std::tanh(x); }
 double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
@@ -251,7 +269,10 @@ double conv_input(const std::vector<float>& y, int ld, const std::vector<float>&
 }
 
 void test_prepare() {
-    for (bool full : {false, true}) {
+    struct PCase { bool full; KvFmt fmt; };
+    for (const PCase pc : {PCase{false, KvFmt::Fp16}, PCase{true, KvFmt::Fp16}, PCase{true, KvFmt::Q4}}) {
+        const bool full = pc.full;
+        const bool q4 = pc.fmt == KvFmt::Q4;
         const int R = 3, p0 = full ? 9000 : 2;   // full: past the log scale's floor; a window row: near the start (zero history)
         const int64_t cap = full ? 9100 : kExtent + 8;
         std::vector<int> pos(R);
@@ -268,6 +289,7 @@ void test_prepare() {
         AttnPrep a;
         a.yq = dyq; a.yk = dyk; a.yv = dyv; a.pos = dpos; a.full = full; a.k_conv = dkc; a.v_conv = dvc; a.q_scale = dqs; a.r_scale = drs;
         a.k_ring = dkr; a.v_ring = dvr; a.k_cache = kcache; a.v_cache = vcache; a.cap = cap; a.q = q; a.r = rr; a.sink = sink;
+        a.kv = pc.fmt;
         attn_prepare(a, R, nullptr);
         cudaDeviceSynchronize();
         // keys and values
@@ -296,13 +318,23 @@ void test_prepare() {
                     const double f = which == 0 ? std::min(22.627417 / (std::sqrt(ss) + 1e-6), 1.0) : 1.0 / std::sqrt(ss / kHeadDim + 1e-6);
                     for (int d = 0; d < kHeadDim; ++d) {
                         const size_t at = ((size_t) (pos[r] % cap) * kKvHeads + h) * kHeadDim + d;
-                        (which ? gv : gk).push_back((float) h2d((which ? hv : hk)[at]));
+                        if (q4) {   // the cell's bytes decoded by the host reference
+                            const uint8_t* base = reinterpret_cast<const uint8_t*>(which ? hv.data() : hk.data()) + (size_t) (pos[r] % cap) * kQ4Cell;
+                            float row[kHeadDim];
+                            kv_q4_get_head(base, h, row);
+                            (which ? gv : gk).push_back(row[d]);
+                        } else {
+                            (which ? gv : gk).push_back((float) h2d((which ? hv : hk)[at]));
+                        }
                         (which ? rv : rk).push_back(val[d] * f);
                     }
                 }
             }
-        report(full ? "attn_prepare keys (full, fp16)" : "attn_prepare keys (window, fp16)", gk, rk, 1e-3);
-        report(full ? "attn_prepare values (full, fp16)" : "attn_prepare values (window, fp16)", gv, rv, 1e-3);
+        // 4-bit codes decode to within one scale of the value (the scale is a group's largest value / 8, up to a few times the
+        // overall max's 1/8 over a whole row's range), so the bound is 0.14 of the largest value; the bitwise check of the
+        // quantizer itself is test_kv_q4_quantizer
+        report(q4 ? "attn_prepare keys (full, q4)" : full ? "attn_prepare keys (full, fp16)" : "attn_prepare keys (window, fp16)", gk, rk, q4 ? 0.14 : 1e-3);
+        report(q4 ? "attn_prepare values (full, q4)" : full ? "attn_prepare values (full, fp16)" : "attn_prepare values (window, fp16)", gv, rv, q4 ? 0.14 : 1e-3);
         // queries, relative states, sinks
         const std::vector<float> gq = host(q, (size_t) R * kHeads * kHeadDim), gr = host(rr, (size_t) R * kHeads * kRel), gs = host(sink, (size_t) R * kHeads);
         std::vector<double> rq(gq.size()), rr2(gr.size()), rsk(gs.size());
@@ -345,8 +377,8 @@ void test_prepare() {
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 void test_attention() {
-    for (int mode = 0; mode < 3; ++mode) {   // a window ring, a full cache, a full cache of E4M3 codes
-        const bool window = mode == 0, fp8 = mode == 2;
+    for (int mode = 0; mode < 4; ++mode) {   // a window ring, a full cache, a full cache of E4M3 codes, a full cache of 4-bit cells
+        const bool window = mode == 0, fp8 = mode == 2, q4 = mode == 3;
         const int R = 4;
         const int p0 = window ? 2900 : 2995;
         const int64_t cap = window ? kExtent + 8 : 3000;
@@ -355,7 +387,16 @@ void test_attention() {
         std::vector<double> kd((size_t) kKvHeads * cap * kHeadDim), vd(kd.size());   // the cached values as the kernel reads them
         std::vector<uint16_t> kh(kd.size()), vh(kd.size());
         std::vector<uint8_t> k8(kd.size()), v8(kd.size());
-        for (size_t i = 0; i < kd.size(); ++i) {
+        Q4Cache k4, v4;
+        if (q4) {
+            k4 = make_q4_cache(cap, 0.6f);
+            v4 = make_q4_cache(cap, 1.0f);
+            for (size_t i = 0; i < kd.size(); ++i) {
+                kd[i] = (double) k4.vals[i];                     // the keys are read exactly
+                vd[i] = h2d(f2h(v4.vals[i]));                    // the values pass through fp16 on their way to the products
+            }
+        }
+        for (size_t i = 0; i < kd.size() && !q4; ++i) {
             const float kf = randn(1, 0.6f)[0], vf = randn(1, 1.0f)[0];
             if (fp8) {
                 const __nv_fp8_e4m3 a(kf), b(vf);
@@ -373,13 +414,14 @@ void test_attention() {
         const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.8f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
         const std::vector<float> sink = randn((size_t) R * kHeads, 2.0f), table = randn((size_t) kRel * kExtent, 0.3f);
         const std::vector<float> gate = randn((size_t) R * kProjQ, 1.5f);
-        void* dk = fp8 ? (void*) dev(k8) : (void*) dev(kh);
-        void* dv = fp8 ? (void*) dev(v8) : (void*) dev(vh);
+        void* dk = q4 ? (void*) dev(k4.bytes) : fp8 ? (void*) dev(k8) : (void*) dev(kh);
+        void* dv = q4 ? (void*) dev(v4.bytes) : fp8 ? (void*) dev(v8) : (void*) dev(vh);
         float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table), *out = zeros<float>((size_t) R * kHeads * kHeadDim);
         float* dgate = dev(gate);
         int* dpos = dev(pos);
         AttnArgs a;
-        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap; a.fp8 = fp8;
+        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
+        a.kv = q4 ? KvFmt::Q4 : fp8 ? KvFmt::Fp8 : KvFmt::Fp16;
         a.window = window ? kExtent : 0;
         const int64_t max_keys = window ? kExtent : p0 + R;
         void* scr = zeros<uint8_t>(attention_decode_scratch(R, 1 << 20));
@@ -410,7 +452,7 @@ void test_attention() {
                     ref[((size_t) r * kHeads + h) * kHeadDim + i] = acc / den;
                 }
             }
-        report(window ? "attention (window ring)" : fp8 ? "attention (full, 3k keys, E4M3)" : "attention (full, 3k keys)", got, ref, 2e-3);
+        report(window ? "attention (window ring)" : q4 ? "attention (full, 3k keys, q4)" : fp8 ? "attention (full, 3k keys, E4M3)" : "attention (full, 3k keys)", got, ref, 2e-3);
         // row 2 alone, and under a launch bound of a million keys
         AttnArgs one = a;
         one.q = dq + 2 * kHeads * kHeadDim; one.r = drs + 2 * kHeads * kRel; one.sink = dsink + 2 * kHeads; one.pos = dpos + 2;
@@ -441,7 +483,7 @@ void test_attention() {
         const double us = time_us([&] { attention_decode(one, 1, max_keys, scr, out1, nullptr); });
         const double keys = window ? kExtent : p0 + 3;
         std::printf("  %.1f us a call (1 row, %.0f keys: %.0f GB/s of K and V)\n", us, keys,
-                    keys * kKvHeads * kHeadDim * (fp8 ? 1 : 2) * 2 / us / 1e3);
+                    keys * (double) kv_cell_bytes(a.kv) * 2 / us / 1e3);
         if (mode == 1) {   // a short context: the latency a decode token sees early on
             std::vector<int> p1 = {40};
             int* dp1 = dev(p1);
@@ -781,7 +823,9 @@ void test_controllers() {
 }
 
 void test_decode_prepare() {
-    for (bool full : {false, true}) {
+    struct DCase { bool full; KvFmt fmt; };
+    for (const DCase dc : {DCase{false, KvFmt::Fp16}, DCase{true, KvFmt::Fp16}, DCase{true, KvFmt::Q4}, DCase{false, KvFmt::Q4}}) {
+        const bool full = dc.full;
         const int R = 4, p0 = full ? 9000 : 1;
         const int64_t cap = full ? 9100 : kExtent + 8;
         std::vector<int> pos(R);
@@ -797,6 +841,7 @@ void test_decode_prepare() {
         a.yq = dy; a.yk = dy + kProjQ; a.yv = dy + kProjQ + kProjKV; a.ldq = a.ldk = a.ldv = kProj;
         a.pos = dpos; a.full = full; a.k_conv = dev(kc); a.v_conv = dev(vc); a.q_scale = dev(qs); a.r_scale = dev(rs);
         a.cap = cap;
+        a.kv = dc.fmt;
         AttnPrep b = a;
         for (AttnPrep* x : {&a, &b}) {
             x->k_ring = dev(kr); x->v_ring = dev(vr);
@@ -807,7 +852,8 @@ void test_decode_prepare() {
         attn_prepare(b, R, nullptr);
         cudaDeviceSynchronize();
         const size_t kvb = (size_t) kKvHeads * cap * kHeadDim * 2;
-        const char* tag = full ? "decode_prepare (full)" : "decode_prepare (window)";
+        const char* tag = dc.fmt == KvFmt::Q4 ? (full ? "decode_prepare (full, q4)" : "decode_prepare (window, q4)")
+                                              : full ? "decode_prepare (full)" : "decode_prepare (window)";
         bool same = !std::memcmp(host((uint8_t*) a.k_cache, kvb).data(), host((uint8_t*) b.k_cache, kvb).data(), kvb) &&
                     !std::memcmp(host((uint8_t*) a.v_cache, kvb).data(), host((uint8_t*) b.v_cache, kvb).data(), kvb) &&
                     host(a.q, (size_t) R * kHeads * kHeadDim) == host(b.q, (size_t) R * kHeads * kHeadDim) &&
@@ -829,14 +875,21 @@ void test_attention_window() {
     const Case cases[] = {{true, 0, 1, kExtent + 8}, {true, 300, 3, kExtent + 8}, {true, 2900, 8, kExtent + 8},
                           {false, 700, 8, 4096}, {false, 120, 2, 4096}, {false, 2000, 2, 4096},
                           {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096}};   // 2 rows: one slice, a slice each, the ring before position 0
-    for (bool fp8 : {false, true})
+    for (const KvFmt fmt : {KvFmt::Fp16, KvFmt::Fp8, KvFmt::Q4})
         for (const Case& k : cases) {
+            const bool fp8 = fmt == KvFmt::Fp8, q4 = fmt == KvFmt::Q4;
             const int R = k.R;
             std::vector<int> pos(R);
             for (int r = 0; r < R; ++r) pos[r] = k.p0 + r;
             const size_t n_kv = (size_t) kKvHeads * k.cap * kHeadDim, elem = fp8 ? 1 : 2;
             std::vector<uint8_t> kc(n_kv * elem), vc(n_kv * elem);
-            for (size_t i = 0; i < n_kv; ++i) {
+            if (q4) {   // the cells' bytes (the buffers are the fp16 cache's size, 3.5x what the cells take)
+                kc = make_q4_cache(k.cap, 0.6f).bytes;
+                vc = make_q4_cache(k.cap, 1.0f).bytes;
+                kc.resize(n_kv * elem);
+                vc.resize(n_kv * elem);
+            }
+            for (size_t i = 0; i < n_kv && !q4; ++i) {
                 const float kf = randn(1, 0.6f)[0], vf = randn(1, 1.0f)[0];
                 if (fp8) {
                     kc[i] = __nv_fp8_e4m3(kf).__x;
@@ -860,12 +913,12 @@ void test_attention_window() {
                 AttnPrep& p = pa[i];
                 p.yq = dy; p.yk = dy + kProjQ; p.yv = dy + kProjQ + kProjKV; p.ldq = p.ldk = p.ldv = kProj;
                 p.pos = dpos; p.full = !k.window; p.k_conv = dev(tk); p.v_conv = dev(tv); p.q_scale = dev(qs); p.r_scale = dev(rsc);
-                p.k_ring = dev(kr); p.v_ring = dev(vr); p.k_cache = dev(kc); p.v_cache = dev(vc); p.cap = k.cap; p.fp8 = fp8;
+                p.k_ring = dev(kr); p.v_ring = dev(vr); p.k_cache = dev(kc); p.v_cache = dev(vc); p.cap = k.cap; p.kv = fmt;
                 p.q = zeros<float>((size_t) R * kHeads * kHeadDim); p.r = zeros<float>((size_t) R * kHeads * kRel);
                 p.sink = zeros<float>((size_t) R * kHeads);
                 AttnArgs& a = aa[i];
                 a.q = p.q; a.r = p.r; a.sink = p.sink; a.rel_table = dev(table); a.pos = dpos; a.k_cache = p.k_cache; a.v_cache = p.v_cache;
-                a.cap = k.cap; a.fp8 = fp8; a.window = k.window ? kExtent : 0; a.gate = dy + kOffGate; a.gate_ld = kProj;
+                a.cap = k.cap; a.kv = fmt; a.window = k.window ? kExtent : 0; a.gate = dy + kOffGate; a.gate_ld = kProj;
                 a.q8 = zeros<uint8_t>((size_t) R * kHeads * kHeadDim / 32 * 36);
             }
             int64_t max_keys = 1024;
@@ -882,20 +935,56 @@ void test_attention_window() {
                               host((uint8_t*) pa[0].v_cache, kvb) == host((uint8_t*) pa[1].v_cache, kvb) &&
                               host(pa[0].k_ring, ringb) == host(pa[1].k_ring, ringb) && host(pa[0].v_ring, ringb) == host(pa[1].v_ring, ringb);
             char tag[96];
-            std::snprintf(tag, sizeof tag, "attention_window (%s%s, %d rows at %d)", k.window ? "window" : "full", fp8 ? ", E4M3" : "", R, k.p0);
+            std::snprintf(tag, sizeof tag, "attention_window (%s%s, %d rows at %d)", k.window ? "window" : "full", fp8 ? ", E4M3" : q4 ? ", q4" : "", R, k.p0);
             std::printf("%-46s %s\n", tag, same ? "bitwise = prepare + attention" : "FAIL");
             failures += !same;
-            if (!fp8 && k.window && R == 1) {
+            if (fmt == KvFmt::Fp16 && k.window && R == 1) {
                 std::printf("  %.1f us a call (1 row, 1 key, fused)  %.1f us (prepare + attention)\n",
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
                             time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }));
             }
-            if (!fp8 && k.window && R == 3) {
+            if (fmt == KvFmt::Fp16 && k.window && R == 3) {
                 std::printf("  %.1f us a call (1 row, 301 keys, fused)  %.1f us (prepare + attention)\n",
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
                             time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }));
             }
         }
+}
+
+// The cache writers' quantizer (kv_q4.cuh through the test hook) against the host reference q4_quantize_group + q4_pack: every byte
+// of 2,000 cells of random values, plus cells of the group shapes the rules single out. Bitwise.
+void test_kv_q4_quantizer() {
+    constexpr int kCells = 2000;
+    std::vector<float> x((size_t) kCells * kKvHeads * kHeadDim);
+    for (int c = 0; c < kCells; ++c) {
+        const std::vector<float> row = randn((size_t) kKvHeads * kHeadDim, c % 7 == 0 ? 0.01f : c % 5 == 0 ? 30.f : 1.f);
+        std::copy(row.begin(), row.end(), x.begin() + (size_t) c * kKvHeads * kHeadDim);
+    }
+    // the shapes: an all-zero group, a group whose largest value is negative, a tie of +m and -m (the positive one is the
+    // group's max), one huge value, equal values
+    float* g = &x[0];
+    for (int i = 0; i < 32; ++i) g[i] = 0.f;                        // cell 0, head 0, group 0: zeros
+    g[32 + 3] = -7.5f; g[32 + 9] = 7.0f;                            // group 1: the largest value is negative
+    g[64 + 5] = 3.0f; g[64 + 20] = -3.0f;                           // group 2: a tie of opposite signs
+    g[96 + 31] = 4000.0f;                                           // group 3: one big value among small ones
+    for (int i = 0; i < 32; ++i) g[128 + i] = 0.5f;                 // head 1 group 0: all equal
+    g[160 + 1] = -3.0f; g[160 + 30] = 3.0f;                         // head 1 group 1: the tie again, the other order
+    float* d_x = dev(x);
+    uint8_t* d_cells = zeros<uint8_t>((size_t) kCells * kQ4Cell);
+    kv_q4_quantize_cells(d_x, d_cells, kCells, nullptr);
+    cudaDeviceSynchronize();
+    const std::vector<uint8_t> got = host(d_cells, (size_t) kCells * kQ4Cell);
+    std::vector<uint8_t> want((size_t) kCells * kQ4Cell, 0);
+    for (int c = 0; c < kCells; ++c) kv_q4_put_cell(&want[(size_t) c * kQ4Cell], &x[(size_t) c * kKvHeads * kHeadDim]);
+    size_t diff = 0, first = (size_t) -1;
+    for (size_t i = 0; i < got.size(); ++i)
+        if (got[i] != want[i]) {
+            ++diff;
+            if (first == (size_t) -1) first = i;
+        }
+    std::printf("%-34s %zu of %zu bytes differ%s\n", "kv q4 quantizer vs host reference", diff, got.size(), diff ? "  FAIL" : "  bitwise");
+    if (diff) std::printf("  first at byte %zu (cell %zu, offset %zu): device %02x, host %02x\n", first, first / kQ4Cell, first % kQ4Cell, got[first], want[first]);
+    failures += diff != 0;
 }
 
 void test_post_attn() {
@@ -1026,6 +1115,7 @@ int main() {
     test_controllers();
     test_decode_prepare();
     test_attention_window();
+    test_kv_q4_quantizer();
     test_post_attn();
     test_expert_prefetch();
     test_moe_finish();
