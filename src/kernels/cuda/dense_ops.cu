@@ -1,6 +1,7 @@
 // src/kernels/cuda/dense_ops.cu - see include/basalt/kernels/dense_ops.hpp.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "philox.cuh"
 
@@ -431,6 +432,11 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         }
         y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
     }
+    // an NVFP4 cache holds the keys turned by the Hadamard transform, so the queries read against it are turned too (the
+    // transform is orthonormal: every dot product is the same); the whole block takes this branch or none of it
+    if constexpr (HDW == 256) {
+        if (q8.fp4) y = kv4_hadamard256(y, xs, d);
+    }
     if (is_q) {
         stf(q_out + (t * n_head + head) * HDW + d, y);
         return;
@@ -447,30 +453,20 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         return;
     }
     if (fa) q8 = far_kv.q8;
-    if (q8.q4) {
-        // 4-bit (q4_0 style): a group is one warp's 32 values.  d = the group's largest-magnitude value (signed) / -8 stored in
-        // fp16, code = round-half-up(x / d) + 8 clamped to 0 .. 15 against the stored d, so the largest value lands on code 0.
-        // The tie between two equal magnitudes of opposite sign is broken to the larger value so every lane agrees.  Even
-        // lanes pack their value (low nibble) with the next lane's (high).
-        float mk = y, mv = vv;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ok = __shfl_xor_sync(0xffffffffu, mk, o), ov = __shfl_xor_sync(0xffffffffu, mv, o);
-            if (fabsf(ok) > fabsf(mk) || (fabsf(ok) == fabsf(mk) && ok > mk)) mk = ok;
-            if (fabsf(ov) > fabsf(mv) || (fabsf(ov) == fabsf(mv) && ov > mv)) mv = ov;
-        }
-        const __half hk = __float2half_rn(mk / -8.0f), hv = __float2half_rn(mv / -8.0f);
-        const float sk = __half2float(hk), sv = __half2float(hv);
-        const float ik = sk != 0.0f ? 1.0f / sk : 0.0f, iv = sv != 0.0f ? 1.0f / sv : 0.0f;
-        const int ck = max(0, min(15, (int) floorf(y * ik + 8.5f))), cv = max(0, min(15, (int) floorf(vv * iv + 8.5f)));
-        const int pk = __shfl_xor_sync(0xffffffffu, ck, 1), pv = __shfl_xor_sync(0xffffffffu, cv, 1);
+    if (q8.fp4) {
+        // NVFP4: per 16 values (16 lanes of a warp) the E4M3 scale amax / 6, each value the nearest E2M1 code against the
+        // decoded scale; a lane pair packs its two codes into one byte, the even dim in the low nibble
+        const int64_t row = cell * n_kv + head;
+        const uint32_t sk = kv4_group_scale(kv4_amax16(y)), sv = kv4_group_scale(kv4_amax16(vv));
+        const uint32_t ck = kv4_group_code(y, kv4_e4m3_value(sk)), cv = kv4_group_code(vv, kv4_e4m3_value(sv));
+        const uint32_t nk = __shfl_down_sync(0xffffffffu, ck, 1), nv = __shfl_down_sync(0xffffffffu, cv, 1);
         if ((d & 1) == 0) {
-            ((uint8_t*) q8.k)[at >> 1] = (uint8_t) (ck | (pk << 4));
-            ((uint8_t*) q8.v)[at >> 1] = (uint8_t) (cv | (pv << 4));
+            reinterpret_cast<uint8_t*>(q8.k)[row * (HDW / 2) + d / 2] = (uint8_t) (ck | (nk << 4));
+            reinterpret_cast<uint8_t*>(q8.v)[row * (HDW / 2) + d / 2] = (uint8_t) (cv | (nv << 4));
         }
-        if ((d & 31) == 0) {
-            q8.ks[(cell * n_kv + head) * (HDW / 32) + d / 32] = __half_as_ushort(hk);
-            q8.vs[(cell * n_kv + head) * (HDW / 32) + d / 32] = __half_as_ushort(hv);
+        if ((d & 15) == 0) {
+            reinterpret_cast<uint8_t*>(q8.ks)[row * (HDW / 16) + d / 16] = (uint8_t) sk;
+            reinterpret_cast<uint8_t*>(q8.vs)[row * (HDW / 16) + d / 16] = (uint8_t) sv;
         }
         return;
     }
