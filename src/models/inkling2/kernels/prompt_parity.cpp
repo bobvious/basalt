@@ -418,6 +418,7 @@ void test_attention_prompt() {
             cudaFree(dt);
             cudaFree(out);
         }
+    }
 }
 
 // ---- --loop-cache last_loop ------------------------------------------------------------------------------------------------

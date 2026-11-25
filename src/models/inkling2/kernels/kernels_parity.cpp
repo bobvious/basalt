@@ -1211,6 +1211,7 @@ void test_attention_window() {
                             time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }), q4 ? ", q4" : kv_tag(kv));
             }
         }
+    }
 }
 
 // Timing only: one decode row over a full cache at depth, per format (cells are random bytes: this measures bytes and
