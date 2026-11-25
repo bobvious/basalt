@@ -173,7 +173,6 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
                 row_scales(kbase + cell, ks);
                 row_scales(vbase + cell, vs);
             }
-            }
         } else {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
