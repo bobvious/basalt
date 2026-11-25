@@ -430,11 +430,10 @@ protected:
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
-        if (m_.last_loop() && v.n > 1) {   // --loop-cache last_loop takes one conversation at a time (solo first)
-            err = "the loop caches are last_loop (one set, not one per pass): a batch window of " + std::to_string(v.n) +
-                  " is refused";
-            return false;
-        }
+        // --loop-cache last_loop batches (11-24): each conversation is its own Session with its own shared loop set, and
+        // segments() hands the kernels each conversation's vc_[slot], so a batch row reads and writes exactly the
+        // (aliased) cells its solo forward would. A batch window never runs the fused kernel (attention_window falls back
+        // when seg.at.n > 0), so the fused path's consecutive-rows assumption does not apply here.
         if (!admit(err)) return false;
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
@@ -1125,13 +1124,9 @@ private:
             io[kMaxRows + i] = positions ? positions[i] : (int32_t) (pos0 + i);
             last = std::max<int64_t>(last, io[kMaxRows + i]);
         }
-        if (m_.last_loop() && rows > 1) {   // the fused kernel's pre-pdl cache reads assume ascending-consecutive rows:
-            for (int i = 1; i < rows; ++i)  // under sharing that is a memory-safety invariant, not just numerics
-                if (io[kMaxRows + i] != io[kMaxRows] + i) {
-                    basalt::log::error("basalt inkling2", "last_loop staged non-consecutive positions");
-                    std::abort();
-                }
-        }
+        // (11-24: the last_loop consecutive-positions abort that sat here is gone. Only batch windows pass `positions`,
+        // and a batch never runs the fused kernel whose pre-pdl reads it protected; each segment's rows are consecutive
+        // by construction (BatchWindow::build). Solo calls stage pos0 + i.)
         cudaMemcpyAsync(io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
         if (Lane& k = lane_[1]; k.stream) {   // the positions to the second card too, after its last window, before this one
             cudaEventRecord(io_ev0_, stream_);

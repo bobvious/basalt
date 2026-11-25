@@ -75,11 +75,6 @@ public:
                                 o.loop_cache.c_str());
             return 2;
         }
-        if (o.loop_cache == "last_loop" && o.batch > 1) {
-            basalt::log::error("basalt inkling2", "--loop-cache last_loop takes one conversation at a time; --batch %d batches its windows",
-                                o.batch);
-            return 2;
-        }
         dspark_finish_flags(o);   // DSPARK HOOK
         return std::nullopt;
     }
