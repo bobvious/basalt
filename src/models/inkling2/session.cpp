@@ -40,6 +40,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -290,24 +291,40 @@ public:
         for (const Visit& v : g_.visits) max_slot = std::max(max_slot, v.slot);
         vc_.assign((size_t) max_slot + 1, VisitCache{});
         slot_card_.assign(vc_.size(), 0);
+        slot_shared_.assign(vc_.size(), 0);
         for (const Visit& v : g_.visits) {
             VisitCache& c = vc_[(size_t) v.slot];
             slot_card_[(size_t) v.slot] = m_.card_of(v.layer);
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
-            const size_t bytes = (size_t) c.cap * (size_t) kv_cell_bytes(m_.visit_fmt(c.ring));   // a full visit's cells, or a ring's
-            if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
-                for (int j = 0; j < 2; ++j) {
-                    auto a = std::make_unique<core::ElasticArray>();
-                    if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
-                    (j ? c.v : c.k) = a->data();
-                    elastic_.push_back(std::move(a));
+            if (loop_visit_shared(g_, v, m_.last_loop())) {   // --loop-cache last_loop: later passes read pass 0's
+                if (vc_[(size_t) v.layer].k == nullptr || vc_[(size_t) v.layer].v == nullptr) {
+                    ok = false;   // the sharing contract (pass 0 takes slot == layer, allocated first) is broken: refuse, never alias null
+                    err = "inkling2: --loop-cache last_loop aliases pass 0's cells before they are allocated";
+                } else {
+                    c.k = vc_[(size_t) v.layer].k;                // cells (pass 0 takes slot == layer, allocated above in
+                    c.v = vc_[(size_t) v.layer].v;                // visit order); the pass's convolution rings stay its own
+                    slot_shared_[(size_t) v.slot] = 1;
                 }
-                backed_ = core::kElasticKvBase;
             } else {
-                c.k = alloc(bytes, ok);
-                c.v = alloc(bytes, ok);
+                if (ok && m_.last_loop() && v.pass == 0 && g_.looped(v.layer) && v.slot != v.layer) {
+                    ok = false;   // the sharing contract needs pass 0's slot == layer: refuse, never alias a foreign buffer
+                    err = "inkling2: --loop-cache last_loop needs pass 0's loop visits at slot == layer";
+                }
+                const size_t bytes = (size_t) c.cap * (size_t) kv_cell_bytes(m_.visit_fmt(c.ring));   // a full visit's cells, or a ring's
+                if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
+                    for (int j = 0; j < 2; ++j) {
+                        auto a = std::make_unique<core::ElasticArray>();
+                        if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
+                        (j ? c.v : c.k) = a->data();
+                        elastic_.push_back(std::move(a));
+                    }
+                    backed_ = core::kElasticKvBase;
+                } else {
+                    c.k = alloc(bytes, ok);
+                    c.v = alloc(bytes, ok);
+                }
             }
             c.k_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
             c.v_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
@@ -343,7 +360,7 @@ public:
         for (cudaEvent_t& e : stage_ev_)
             if (ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) ok = false;
         if (!ok) {
-            err = "out of device memory for the session";
+            if (err.empty()) err = "out of device memory for the session";   // contract refusals above set their own message
             return false;
         }
         // the scratch every session of the model shares: the first session makes it
@@ -413,6 +430,11 @@ protected:
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
+        if (m_.last_loop() && v.n > 1) {   // --loop-cache last_loop takes one conversation at a time (solo first)
+            err = "the loop caches are last_loop (one set, not one per pass): a batch window of " + std::to_string(v.n) +
+                  " is refused";
+            return false;
+        }
         if (!admit(err)) return false;
         Admitted held{*this};   // passed to the driver (batch_end) once the stage succeeds
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
@@ -635,7 +657,8 @@ public:
 
     size_t running_bytes() const override {
         size_t n = 0;
-        for (const VisitCache& c : vc_) n += (c.ring ? 2 * kv_bytes_of(c) : 0) + conv_ring_bytes();
+        for (size_t i = 0; i < vc_.size(); ++i)
+            n += (!slot_shared_[i] && vc_[i].ring ? 2 * kv_bytes_of(vc_[i]) : 0) + conv_ring_bytes();   // shared slots hold no K/V (rings stay per slot)
         return n + dspark_.running_bytes();   // DSPARK HOOK
     }
 
@@ -647,7 +670,7 @@ public:
         for (size_t i = 0; i < vc_.size(); ++i) {   // the second card's visits go with its stream
             const VisitCache& c = vc_[i];
             std::vector<core::DeviceRegion>& to = slot_card_[i] ? st.peer_regions : st.regions;
-            if (c.ring) {
+            if (c.ring && !slot_shared_[i]) {   // --loop-cache last_loop holds one loop-layer set (conv rings stay per pass)
                 to.push_back({c.k, kv_bytes_of(c)});
                 to.push_back({c.v, kv_bytes_of(c)});
             }
@@ -671,19 +694,25 @@ public:
     }
 
     // 3: fp16 rows, 1: unit-scale E4M3, 4: scaled INT8, 5: --kv q4 cells (kv_cell_bytes(Q4) = 576 B: the codes of the
-    // 8 heads, then their scales)
+    // 8 heads, then their scales). --loop-cache last_loop adds 10 (13/11/14/15) when a loop-layer set is actually
+    // shared, so a cross-mode restore fails here instead of silently misrestoring.
     int cell_format() const {
-        switch (m_.cache_fmt()) {
-            case KvFmt::Fp8: return 1;
-            case KvFmt::Q4: return 5;
-            default: return m_.cache_int8() ? 4 : 3;
-        }
+        const int base = [this] {
+            switch (m_.cache_fmt()) {
+                case KvFmt::Fp8: return 1;
+                case KvFmt::Q4: return 5;
+                default: return m_.cache_int8() ? 4 : 3;
+            }
+        }();
+        size_t shared = 0;
+        for (char s : slot_shared_) shared += (size_t) (s != 0);
+        return (m_.last_loop() && shared > 0) ? base + 10 : base;
     }
 
     size_t cells_bytes(int64_t positions) const override {
         size_t n = 0;
-        for (const VisitCache& c : vc_)
-            if (!c.ring) n += 2 * (size_t) positions * (size_t) cell_bytes();
+        for (size_t i = 0; i < vc_.size(); ++i)
+            if (!vc_[i].ring && !slot_shared_[i]) n += 2 * (size_t) positions * (size_t) cell_bytes();
         return n + dspark_.cells_bytes(positions);   // DSPARK HOOK
     }
 
@@ -693,8 +722,9 @@ public:
         cudaStreamSynchronize(stream_);
         kv.clear();
         const size_t run = (size_t) positions * (size_t) cell_bytes();
-        for (const VisitCache& c : vc_) {
-            if (c.ring) continue;
+        for (size_t i = 0; i < vc_.size(); ++i) {   // --loop-cache last_loop holds one loop-layer set: shared slots save nothing
+            const VisitCache& c = vc_[i];
+            if (c.ring || slot_shared_[i]) continue;
             core::ConversationKv k;
             k.format = cell_format();
             k.page_size = 1;
@@ -721,8 +751,9 @@ public:
         cudaStreamSynchronize(stream_);
         const size_t run = (size_t) positions * (size_t) cell_bytes();
         size_t i = 0;
-        for (const VisitCache& c : vc_) {
-            if (c.ring) continue;
+        for (size_t s = 0; s < vc_.size(); ++s) {   // same order and skips as save_cells: shared slots hold nothing
+            const VisitCache& c = vc_[s];
+            if (c.ring || slot_shared_[s]) continue;
             if (i >= kv.size() || kv[i].format != cell_format() || kv[i].cells != positions || kv[i].heads != kKvHeads ||
                 kv[i].k.size() < run || kv[i].v.size() < run)
                 return {model::Status::Error, "inkling2: a parked conversation has other caches"};
@@ -741,7 +772,8 @@ public:
 
     int64_t kv_bytes() const override {
         int64_t n = 0;
-        for (const VisitCache& c : vc_) n += 2 * (int64_t) kv_bytes_of(c);
+        for (size_t i = 0; i < vc_.size(); ++i)
+            if (!slot_shared_[i]) n += 2 * (int64_t) kv_bytes_of(vc_[i]);   // one loop-layer set, not one per pass
         return n;
     }
 
@@ -778,7 +810,9 @@ public:
         const std::string n = std::to_string(expert_pairs() - m_.spill().spilled);
         uint64_t ram = 0;
         for (int l = 0; l < g_.n_layers; ++l) ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
-        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_int8() ? " kv=int8 " : m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") +
+        size_t shared = 0;
+        for (char s : slot_shared_) shared += (size_t) (s != 0);
+        return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_int8() ? " kv=int8 " : m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") + ((m_.last_loop() && shared > 0) ? "loop=last_loop " : "") +
                program::spill_words({0, expert_pairs(), 0});
     }
 
@@ -1091,6 +1125,13 @@ private:
             io[kMaxRows + i] = positions ? positions[i] : (int32_t) (pos0 + i);
             last = std::max<int64_t>(last, io[kMaxRows + i]);
         }
+        if (m_.last_loop() && rows > 1) {   // the fused kernel's pre-pdl cache reads assume ascending-consecutive rows:
+            for (int i = 1; i < rows; ++i)  // under sharing that is a memory-safety invariant, not just numerics
+                if (io[kMaxRows + i] != io[kMaxRows] + i) {
+                    basalt::log::error("basalt inkling2", "last_loop staged non-consecutive positions");
+                    std::abort();
+                }
+        }
         cudaMemcpyAsync(io_d_, io, (size_t) 2 * kMaxRows * 4, cudaMemcpyHostToDevice, stream_);
         if (Lane& k = lane_[1]; k.stream) {   // the positions to the second card too, after its last window, before this one
             cudaEventRecord(io_ev0_, stream_);
@@ -1386,6 +1427,7 @@ private:
     Lane lane_[2];                           // each card's side of the forward (the first card's: the members above)
     std::vector<Segment> segs_;              // the walk's runs of visits on each card (walk.hpp split_walk)
     std::vector<int> slot_card_;             // [cache slot] the card of its visits
+    std::vector<char> slot_shared_;          // [cache slot] --loop-cache last_loop: the slot reads pass 0's K/V cells
     cudaEvent_t hand0_ = nullptr, io_ev0_ = nullptr, io_ev1_ = nullptr;   // the first card's crossing; the second card's positions
     std::vector<VisitCache> vc_;
     std::shared_ptr<Shared> sh_;             // the scratch, the prompt path and the batch graphs every session shares

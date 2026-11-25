@@ -643,6 +643,100 @@ void test_attention() {
     }
 }
 
+// ---- --loop-cache last_loop ------------------------------------------------------------------------------------------------
+//
+// Three loop passes over one full visit's caches with no past (the first forward, as the reference PR's
+// test_last_loop_single_forward_matches_per_loop): last_loop keeps one K/V set that every pass writes and reads,
+// per_loop one set per pass. Per pass the outputs and the written cells match bitwise across modes, the shared set ends
+// as the last pass's cells (last-wins), and the loop layer's K/V bytes are one set, not three. The convolution rings stay
+// per-pass in both modes (fresh zeros every pass here, as the session allocates). fp16/fp8/int8 run attention_window (the
+// fused prod path at this shape), q4 decode_prepare + attention_decode (the only q4 path, and the money arm with last_loop).
+// The q4 arm also compares the decode path's float output, not just its q8 shadow (the fused arm has no float out).
+void test_last_loop() {
+    for (int qi = 0; qi < 4; ++qi) {   // every --kv the flag accepts: fp16, fp8, int8, q4
+        const bool q4 = qi == 3;
+        const Kv fkv = qi == 1 ? kE4M3 : qi == 2 ? kI8 : kF16;
+        const int kPasses = 3;   // the model's loop pass count: passes before the last read the shared set, the last writes it
+        const int R = 2, p0 = 40;
+        const int64_t cap = 64, max_keys = 64;
+        std::vector<int> pos(R);
+        for (int r = 0; r < R; ++r) pos[r] = p0 + r;
+        int* dpos = dev(pos);
+        const std::vector<float> tk = randn(1024 * kConv, 0.3f), tv = randn(1024 * kConv, 0.3f);
+        const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
+        const std::vector<float> table = fixed_values((size_t) kRel * kExtent, 0.3f, 0x5bd1e995u);
+        float *dtk = dev(tk), *dtv = dev(tv), *dqs = dev(qs), *drsc = dev(rsc), *dtable = dev(table);
+        const size_t cellb = q4 ? kQ4Cell : kv_bytes(fkv);
+        const size_t q8b = (size_t) R * kHeads * kHeadDim / 32 * 36;
+        // the shared set (last_loop, allocated once) and one set per pass (per_loop): K and V, poisoned
+        uint8_t *sk = poisoned(cellb * (size_t) cap), *sv = poisoned(cellb * (size_t) cap);
+        uint8_t* pk[kPasses], *pv[kPasses];
+        for (int p = 0; p < kPasses; ++p) {
+            pk[p] = poisoned(cellb * (size_t) cap);
+            pv[p] = poisoned(cellb * (size_t) cap);
+        }
+        void* scr = zeros<uint8_t>(attention_decode_scratch(R, max_keys));
+        for (int p = 0; p < kPasses; ++p) {
+            // a pass's own projection inputs (distinct per pass: later passes overwrite earlier cells with other values)
+            const std::vector<float> y = fixed_values((size_t) R * kProj, 1.5f, 0x12345678u + (uint32_t) p);
+            const std::vector<float> sink = fixed_values((size_t) R * kHeads, 2.0f, 0x9e3779b9u + (uint32_t) p);
+            float* dy = dev(y), *dsink = dev(sink);
+            std::vector<uint8_t> out[2], ck[2], cv[2];
+            std::vector<float> outf[2];   // the decode path's float output (the q8 compare alone is lossy)
+            for (int m = 0; m < 2; ++m) {   // m = 0: the shared set, m = 1: this pass's own set
+                uint8_t *kcache = m ? pk[p] : sk, *vcache = m ? pv[p] : sv;
+                AttnPrep pa;
+                pa.yq = dy; pa.yk = dy + kProjQ; pa.yv = dy + kProjQ + kProjKV; pa.ldq = pa.ldk = pa.ldv = kProj;
+                pa.pos = dpos; pa.full = true; pa.k_conv = dtk; pa.v_conv = dtv; pa.q_scale = dqs; pa.r_scale = drsc;
+                pa.k_ring = zeros<float>((size_t) kConvRing * 1024); pa.v_ring = zeros<float>((size_t) kConvRing * 1024);
+                pa.k_cache = kcache; pa.v_cache = vcache; pa.cap = cap;
+                if (q4) { pa.kv = KvFmt::Q4; pa.fp8 = false; pa.int8 = false; } else kv_set(fkv, pa);
+                pa.q = zeros<float>((size_t) R * kHeads * kHeadDim); pa.r = zeros<float>((size_t) R * kHeads * kRel);
+                pa.sink = zeros<float>((size_t) R * kHeads);
+                cudaMemcpy(pa.sink, dsink, (size_t) R * kHeads * 4, cudaMemcpyHostToDevice);
+                AttnArgs aa;
+                aa.q = pa.q; aa.r = pa.r; aa.sink = pa.sink; aa.rel_table = dtable; aa.pos = dpos;
+                aa.k_cache = kcache; aa.v_cache = vcache; aa.cap = cap;
+                if (q4) { aa.kv = KvFmt::Q4; aa.fp8 = false; aa.int8 = false; } else kv_set(fkv, aa);
+                aa.window = 0;
+                aa.scale = 1.0f / std::sqrt((float) kHeadDim);
+                aa.gate = dy + kOffGate; aa.gate_ld = kProj;
+                aa.q8 = zeros<uint8_t>(q8b);
+                if (q4) {
+                    decode_prepare(pa, R, nullptr);
+                    float* dout = zeros<float>((size_t) R * kHeads * kHeadDim);
+                    attention_decode(aa, R, max_keys, scr, dout, nullptr);
+                    outf[m] = host(dout, (size_t) R * kHeads * kHeadDim);
+                } else {
+                    attention_window(pa, aa, R, max_keys, scr, nullptr);
+                }
+                cudaDeviceSynchronize();
+                out[m] = host((uint8_t*) aa.q8, q8b);
+                ck[m] = host(kcache, cellb * (size_t) cap);
+                cv[m] = host(vcache, cellb * (size_t) cap);
+            }
+            char tag[64];
+            std::snprintf(tag, sizeof tag, "last_loop pass %d outputs vs per_loop%s", p, q4 ? " (q4)" : kv_tag(fkv));
+            same_bits(tag, out[0].data(), out[1].data(), q8b);
+            if (q4) {   // the decode path's float output, not just its q8 shadow (the fused arm has no float out)
+                std::snprintf(tag, sizeof tag, "last_loop pass %d float outputs vs per_loop (q4)", p);
+                const std::vector<uint8_t> f0 = bytes_of(outf[0]), f1 = bytes_of(outf[1]);
+                same_bits(tag, f0.data(), f1.data(), f0.size());
+            }
+            // the shared set ends each pass as that pass's cells over the rows it writes (a 2-row overwrite check,
+            // not a whole-buffer proof): pass 2's compare shows earlier passes' values at rows 40..41 were overwritten,
+            // not kept beside them
+            std::snprintf(tag, sizeof tag, "last_loop pass %d K cells vs per_loop%s", p, q4 ? " (q4)" : kv_tag(fkv));
+            same_bits(tag, ck[0].data(), ck[1].data(), ck[0].size());
+            std::snprintf(tag, sizeof tag, "last_loop pass %d V cells vs per_loop%s", p, q4 ? " (q4)" : kv_tag(fkv));
+            same_bits(tag, cv[0].data(), cv[1].data(), cv[0].size());
+        }
+        // NOTE: no byte-count assert here on purpose. The 1x-vs-3x sizing lives in session_bytes(), which this
+        // kernel-level test cannot call (it would need to link the model); asserting arithmetic on two locals would
+        // print ok unconditionally. The session constructor's allocation count is the real check (see PORT-BRIEF).
+    }
+}
+
 // ---- post-sublayer convolutions ----------------------------------------------------------------------------------------
 
 void test_post_conv() {
@@ -2103,6 +2197,7 @@ int main() {
     test_controllers();
     test_decode_prepare();
     test_attention_window();
+    test_last_loop();
     test_kv_q4_quantizer();
     time_attention_depth();
     test_post_attn();

@@ -46,6 +46,9 @@ struct CommonOptions {
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
+    /// --loop-cache per_loop|last_loop: the loop layers' KV caches, one set per pass or one set written by the
+    /// last pass (empty: the model's default, per_loop). Taken by the models that loop layers.
+    std::string loop_cache;
     /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
     basalt::model::RopeFlags rope;
     /// --route-tail-skip, --route-prior: taken by the mixture-of-experts models (basalt/model/route_flags.hpp)

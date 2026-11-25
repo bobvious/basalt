@@ -50,10 +50,16 @@ public:
     const char* model_name() const override { return "Inkling-2-Mini"; }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
-    // --kv: the attention caches as fp16 (the default), fp8, q4 or scaled int8; --spec, --draft-log: the drafter's windows
+    // --kv: the attention caches as fp16 (the default), fp8, q4 or scaled int8;
+    // --loop-cache: the loop layers' KV caches as one set per pass (per_loop, the default) or one set written by the
+    // last pass (last_loop); --spec, --draft-log: the drafter's windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
+            return true;
+        }
+        if (a == "--loop-cache") {
+            o.loop_cache = args.next("--loop-cache");
             return true;
         }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
@@ -62,6 +68,16 @@ public:
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
         if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "q4" && o.kv != "int8") {
             basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8, q4 or int8", o.kv.c_str());
+            return 2;
+        }
+        if (!o.loop_cache.empty() && o.loop_cache != "per_loop" && o.loop_cache != "last_loop") {
+            basalt::log::error("basalt inkling2", "--loop-cache %s: the loop layers' caches are per_loop (the default) or last_loop",
+                                o.loop_cache.c_str());
+            return 2;
+        }
+        if (o.loop_cache == "last_loop" && o.batch > 1) {
+            basalt::log::error("basalt inkling2", "--loop-cache last_loop takes one conversation at a time; --batch %d batches its windows",
+                                o.batch);
             return 2;
         }
         dspark_finish_flags(o);   // DSPARK HOOK

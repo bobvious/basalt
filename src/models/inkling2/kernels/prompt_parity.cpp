@@ -420,6 +420,85 @@ void test_attention_prompt() {
         }
 }
 
+// ---- --loop-cache last_loop ------------------------------------------------------------------------------------------------
+//
+// Three loop passes over one full visit's caches with no past (the prompt side of the first-forward identity): last_loop
+// keeps one K/V set that every chunk write shares (a full visit passes its cache as the chunk again, as prompt.cpp does),
+// per_loop one set per pass. Per pass the outputs and the written cells match bitwise across modes, the shared set ends as
+// the last pass's cells, and the loop layer's K/V bytes are one set, not three. The convolution rings stay per-pass in both
+// modes (fresh zeros every pass here, as the session allocates). fp16, fp8, int8 and q4 (the money arm with last_loop).
+void test_last_loop_prompt() {
+    for (int qi = 0; qi < 4; ++qi) {   // every --kv the flag accepts
+        const bool q4 = qi == 3;
+        const Kv fkv = qi == 1 ? kE4M3 : qi == 2 ? kI8 : kF16;
+        const int kPasses = 3;   // the model's loop pass count
+        const int R = 8;
+        const int64_t pos0 = 0, cap = 64;   // the first forward: no past, the chunk is positions [0, R)
+        const std::vector<float> tk = randn(1024 * kConv, 0.3f), tv = randn(1024 * kConv, 0.3f);
+        const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
+        const std::vector<float> table = randn((size_t) kRel * kExtent, 0.3f);
+        float *dtk = dev(tk), *dtv = dev(tv), *dqs = dev(qs), *drsc = dev(rsc), *dtable = dev(table);
+        const size_t cellb = q4 ? kQ4Cell : kv_bytes(fkv);
+        std::vector<int32_t> pos(R);
+        for (int r = 0; r < R; ++r) pos[r] = r;
+        int32_t* dpos = dev(pos);
+        // the shared set (last_loop, allocated once) and one set per pass (per_loop)
+        uint8_t *sk = zeros<uint8_t>(cellb * (size_t) cap), *sv = zeros<uint8_t>(cellb * (size_t) cap);
+        uint8_t* pk[kPasses], *pv[kPasses];
+        for (int p = 0; p < kPasses; ++p) {
+            pk[p] = zeros<uint8_t>(cellb * (size_t) cap);
+            pv[p] = zeros<uint8_t>(cellb * (size_t) cap);
+        }
+        for (int p = 0; p < kPasses; ++p) {
+            // a pass's own chunk inputs (distinct per pass: later passes overwrite earlier cells with other values)
+            const std::vector<float> yq = randn((size_t) R * kProjQ, 1.5f), yk = randn((size_t) R * kProjKV, 2.0f);
+            const std::vector<float> yv = randn((size_t) R * kProjKV, 0.6f), sink = randn((size_t) R * kHeads, 2.0f);
+            float *dyq = dev(yq), *dyk = dev(yk), *dyv = dev(yv), *dsink = dev(sink);
+            std::vector<float> out[2];
+            std::vector<uint8_t> ck[2], cv[2];
+            for (int m = 0; m < 2; ++m) {   // m = 0: the shared set, m = 1: this pass's own set
+                uint8_t *kcache = m ? pk[p] : sk, *vcache = m ? pv[p] : sv;
+                AttnPrep pa;
+                pa.yq = dyq; pa.yk = dyk; pa.yv = dyv; pa.ldq = kProjQ; pa.ldk = pa.ldv = kProjKV;
+                pa.pos = dpos; pa.full = true; pa.k_conv = dtk; pa.v_conv = dtv; pa.q_scale = dqs; pa.r_scale = drsc;
+                pa.k_ring = zeros<float>((size_t) kConvRing * 1024);
+                pa.v_ring = zeros<float>((size_t) kConvRing * 1024);
+                pa.k_cache = kcache; pa.v_cache = vcache; pa.cap = cap;
+                if (q4) { pa.kv = KvFmt::Q4; pa.fp8 = false; pa.int8 = false; } else { pa.fp8 = fkv == kE4M3; pa.int8 = fkv == kI8; }
+                pa.q = zeros<float>((size_t) R * kHeads * kHeadDim); pa.r = zeros<float>((size_t) R * kHeads * kRel);
+                pa.sink = zeros<float>((size_t) R * kHeads);
+                cudaMemcpy(pa.sink, dsink, (size_t) R * kHeads * 4, cudaMemcpyHostToDevice);
+                attn_prepare(pa, R, S);
+                AttnPromptArgs aa;
+                aa.q = pa.q; aa.r = pa.r; aa.sink = pa.sink; aa.rel_table = dtable; aa.pos0 = pos0;
+                aa.k_cache = kcache; aa.v_cache = vcache; aa.cap = cap;
+                aa.k_chunk = kcache; aa.v_chunk = vcache; aa.chunk_cap = cap;   // a full visit passes its cache again
+                if (q4) { aa.kv = KvFmt::Q4; aa.fp8 = false; aa.int8 = false; } else { aa.fp8 = fkv == kE4M3; aa.int8 = fkv == kI8; }
+                aa.window = 0;
+                aa.scale = 1.0f / std::sqrt((float) kHeadDim);
+                float* o = zeros<float>((size_t) R * kHeads * kHeadDim);
+                attention_prompt(aa, R, o, S);
+                cudaDeviceSynchronize();
+                out[m] = host(o, (size_t) R * kHeads * kHeadDim);
+                ck[m] = host(kcache, cellb * (size_t) cap);
+                cv[m] = host(vcache, cellb * (size_t) cap);
+            }
+            const char* ftag = q4 ? " (q4)" : fkv == kE4M3 ? " (fp8)" : fkv == kI8 ? " (int8)" : "";
+            char tag[64];
+            std::snprintf(tag, sizeof tag, "last_loop prompt pass %d outputs vs per_loop%s", p, ftag);
+            same_bits(tag, out[0].data(), out[1].data(), out[0].size() * 4);
+            // the shared set ends each pass as that pass's cells over the rows it writes (a row-range overwrite
+            // check, not a whole-buffer proof)
+            std::snprintf(tag, sizeof tag, "last_loop prompt pass %d K cells vs per_loop%s", p, ftag);
+            same_bits(tag, ck[0].data(), ck[1].data(), ck[0].size());
+            std::snprintf(tag, sizeof tag, "last_loop prompt pass %d V cells vs per_loop%s", p, ftag);
+            same_bits(tag, cv[0].data(), cv[1].data(), cv[0].size());
+        }
+        // NOTE: no byte-count assert here on purpose (see test_last_loop in kernels_parity.cpp): the 1x-vs-3x sizing
+        // lives in session_bytes(), which this kernel-level test cannot call.
+    }
+}
+
 // A chunk's staged rows into the window ring (stage_to_ring): the last `keep` positions of the chunk, cell for cell, in each
 // format, past the ring's wrap; the ring's other cells untouched.
 void test_stage_to_ring() {
@@ -1328,6 +1407,7 @@ int main() {
     cudaStreamCreate(&S);
     test_dense();
     test_attention_prompt();
+    test_last_loop_prompt();
     test_stage_to_ring();
     test_router();
     test_sort();

@@ -94,6 +94,8 @@ public:
     KvFmt visit_fmt(bool ring) const { return ring ? ring_fmt(kv_) : kv_; }
     bool cache_fp8() const { return fp8_; }
     bool cache_int8() const { return int8_; }
+    /// --loop-cache last_loop: the loop layers' later passes share pass 0's K/V cells (one set, not one per pass).
+    bool last_loop() const { return last_loop_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests
     /// and windows, so nothing reads the experts while it holds their memory (lend_room).
     ImageEncoder& encoder() const { return vis_; }
@@ -203,6 +205,7 @@ private:
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
     KvFmt kv_ = KvFmt::Fp16;
+    bool last_loop_ = false;             ///< --loop-cache last_loop: later loop passes share pass 0's K/V cells
     int ldev_ = 0;                           ///< the card the weights being planned load to
     bool fp8_ = false, int8_ = false;
     int64_t ctx_ = kDefaultContext;
@@ -250,9 +253,25 @@ private:
 /// A session over `model`; null with `err` set.
 std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::string& err);
 
+/// --loop-cache last_loop: a loop layer's later passes share pass 0's K/V cell buffers (pass 0 writes them first, the
+/// last pass last; every pass reads last-pass past + its own current rows, as the transformers PastReader does). True for
+/// a loop layer's visit of pass > 0; a non-loop visit is always pass 0, so it always holds its own cells.
+/// Sliding-window loop layers are shared too (their rings, not just full cells): a ring cell for a position is written by
+/// every pass, so after a forward it holds the last pass's value, and no pass reads a ring cell written by an earlier pass
+/// of the same forward (decode reads keys < p0, prompt reads past < pos0, stage_to_ring clamps first to pos0).
+/// Correctness rests on two invariants, both true today and asserted nowhere else: (1) nothing observes a loop layer's
+/// cells between passes of one forward (save_cells/running_state run at turn/chunk boundaries, never mid-visit-sequence);
+/// (2) no kernel path writes a shared cell in the range a later pass of the same forward reads as past. If either is ever
+/// relaxed, the transient writes become visible and diverge silently from the reference's non-writing readers.
+inline bool loop_visit_shared(const Geometry& g, const Visit& v, bool last_loop) {
+    return last_loop && v.pass > 0 && g.looped(v.layer);
+}
+
 /// The device bytes a session takes for `context` positions in the selected KV cache format (kv_cell_bytes: fp16
-/// 2,048 B a cell, fp8 1,024, q4 576; the rings of a q4 session are fp8), its drafter aside.
-uint64_t session_bytes(const Geometry& g, int64_t context, KvFmt kv);
+/// 2,048 B a cell, fp8 1,024, q4 576; the rings of a q4 session are fp8), its drafter aside. Pass last_loop=true
+/// under --loop-cache last_loop so the loop layers price one set, not one per pass (there is no per_loop default:
+/// every caller states the mode).
+uint64_t session_bytes(const Geometry& g, int64_t context, KvFmt kv, bool last_loop);
 /// The device bytes a session takes for `context` positions in the selected KV cache format, its drafter aside, on card
 /// `card` of a split at `cut` (0: one card, every visit).
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut = 0, int card = 0);

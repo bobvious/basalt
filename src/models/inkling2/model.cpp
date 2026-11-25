@@ -68,9 +68,10 @@ uint64_t expert_stride(int type, uint64_t blob) {
 }
 }  // namespace
 
-uint64_t session_bytes(const Geometry& g, int64_t context, KvFmt kv) {
+uint64_t session_bytes(const Geometry& g, int64_t context, KvFmt kv, bool last_loop) {
     uint64_t caches = 0;
     for (const Visit& v : g.visits) {
+        if (loop_visit_shared(g, v, last_loop)) continue;   // one loop-layer set, not one per pass
         const KvFmt f = g.swa[(size_t) v.layer] ? ring_fmt(kv) : kv;   // Q4 keeps its rings in fp8
         caches += 2ull * kv_cell_bytes(f) *
                   (g.swa[(size_t) v.layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
@@ -240,8 +241,11 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     uint64_t dense = n_vocab * kQ8Row, experts = 0;
     layers_.assign((size_t) g.n_layers, LayerWeights{});
     // two cards (gpu-mode split): the layer split's cut from the shares (model/multi_gpu.hpp)
-    if (req.gpus.mode == program::GpuMode::Split)
+    if (req.gpus.mode == program::GpuMode::Split) {
+        if (req.loop_cache == "last_loop")
+            return fail("--loop-cache last_loop takes one card; the layer split runs later layers on a second one");
         if (model::Result r = plan_cards(req); !r.ok()) return r;
+    }
     // the loop's message queries of every core layer in one array on each card that runs a core layer: a pass's messages
     // are one launch
     const uint64_t msg_floats = (uint64_t) kStreams * n_embd;
@@ -345,6 +349,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         w.expert_stride = expert_stride(el.gu_type, el.blob_bytes);
     }
     kv_ = req.kv == "q4" ? KvFmt::Q4 : req.kv == "fp8" ? KvFmt::Fp8 : KvFmt::Fp16;
+    last_loop_ = req.loop_cache == "last_loop";
     ldev_ = device_;
     cudaSetDevice(device_);
     fp8_ = req.kv == "fp8";
@@ -380,8 +385,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = kCardSpare - vision_modules + reserve_;
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, kv_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
-        };
+            return session_bytes(g, c, kv_, last_loop_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
