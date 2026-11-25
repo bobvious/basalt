@@ -303,6 +303,7 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
         void* cache = which ? a.v_cache : a.k_cache;
         if (a.kv == KvFmt::Q4) {   // --kv q4: the warp's head row quantized into the cell (kv_q4.cuh)
+            float val[4] = {val0, val1, val2, val3};
             float x[4];
 #pragma unroll
             for (int u = 0; u < 4; ++u) x[u] = val[u] * f;
@@ -317,7 +318,6 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
             // the fp8 test also accepts the kv field (a ring visit under --kv q4 carries kv=Fp8 with the flag clear)
             store_kv4(cache, a.fp8 || a.kv == KvFmt::Fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4,
                       val0 * f, val1 * f, val2 * f, val3 * f);
-        }
         }
     }
     // queries: warp w takes heads 3w .. 3w + 2
