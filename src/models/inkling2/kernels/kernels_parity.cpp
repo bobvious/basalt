@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <random>
@@ -92,6 +93,13 @@ void report(const char* what, const std::vector<float>& got, const std::vector<d
 void same_bits(const char* what, const void* a, const void* b, size_t bytes) {
     const bool ok = std::memcmp(a, b, bytes) == 0;
     std::printf("%-34s %s\n", what, ok ? "bitwise" : "FAIL");
+    if (!ok) {   // debug: where and how much
+        const uint8_t *x = (const uint8_t*) a, *y = (const uint8_t*) b;
+        size_t first = bytes, last = 0, n = 0;
+        for (size_t i = 0; i < bytes; ++i)
+            if (x[i] != y[i]) { if (first == bytes) first = i; last = i; ++n; }
+        std::printf("    %zu of %zu bytes differ, first %zu last %zu\n", n, bytes, first, last);
+    }
     failures += !ok;
 }
 // An FNV-1a hash of a result's bytes: a change meant to keep the bits keeps it.
@@ -653,14 +661,13 @@ void test_attention() {
 // fused prod path at this shape), q4 decode_prepare + attention_decode (the only q4 path, and the money arm with last_loop).
 // The q4 arm also compares the decode path's float output, not just its q8 shadow (the fused arm has no float out).
 void test_last_loop() {
-    // fp16, fp8, q4. INT8 is quarantined (11-25): with a poison past its shared-vs-private
-    // outputs AND cells diverge, while fp16/fp8/q4 match bitwise. Same inputs except the past
-    // cells, so the int8 decode path must read something arm-dependent (past scales? OOB?);
-    // not root-caused. int8+last_loop is therefore UNGATED: excluded from the A/B, do not ship
-    // it on these tests. Re-enable with a seeded (valid-data) past once debugged.
-    for (int qi = 0; qi < 3; ++qi) {   // fp16, fp8, q4
-        const bool q4 = qi == 2;
-        const Kv fkv = qi == 1 ? kE4M3 : kF16;
+    // Every --kv the flag accepts: fp16, fp8, int8, q4. (11-24: the int8 "quarantine" and the fp16/fp8 failures were one
+    // TEST bug: a non-q4 cell was sized as ONE head row (kv_bytes) instead of kKvHeads of them, so the kernel read and
+    // wrote heads 1..7 out of bounds into neighbouring allocations, the other arm's caches among them; compute-sanitizer
+    // memcheck flagged the read at cap*cellb. q4's kQ4Cell already spans every head, which is why q4 passed.)
+    for (int qi = 0; qi < 4; ++qi) {
+        const bool q4 = qi == 3;
+        const Kv fkv = qi == 1 ? kE4M3 : qi == 2 ? kI8 : kF16;
         const int kPasses = 3;   // the model's loop pass count: passes before the last read the shared set, the last writes it
         const int R = 2, p0 = 40;
         const int64_t cap = 64, max_keys = 64;
@@ -671,7 +678,7 @@ void test_last_loop() {
         const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
         const std::vector<float> table = fixed_values((size_t) kRel * kExtent, 0.3f, 0x5bd1e995u);
         float *dtk = dev(tk), *dtv = dev(tv), *dqs = dev(qs), *drsc = dev(rsc), *dtable = dev(table);
-        const size_t cellb = q4 ? kQ4Cell : kv_bytes(fkv);
+        const size_t cellb = q4 ? kQ4Cell : (size_t) kKvHeads * kv_bytes(fkv);   // one position = every KV head's row
         const size_t q8b = (size_t) R * kHeads * kHeadDim / 32 * 36;
         // the shared set (last_loop, allocated once) and one set per pass (per_loop): K and V, poisoned
         uint8_t *sk = poisoned(cellb * (size_t) cap), *sv = poisoned(cellb * (size_t) cap);
@@ -2191,6 +2198,11 @@ int main() {
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("no GPU\n");
         return 77;
+    }
+    if (const char* only = std::getenv("PARITY_ONLY"); only && std::strcmp(only, "last_loop") == 0) {   // debug: one test alone
+        test_last_loop();
+        std::fflush(stdout);
+        return 0;
     }
     test_mix();
     test_ctrl();

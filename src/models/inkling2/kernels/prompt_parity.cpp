@@ -439,7 +439,7 @@ void test_last_loop_prompt() {
         const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
         const std::vector<float> table = randn((size_t) kRel * kExtent, 0.3f);
         float *dtk = dev(tk), *dtv = dev(tv), *dqs = dev(qs), *drsc = dev(rsc), *dtable = dev(table);
-        const size_t cellb = q4 ? kQ4Cell : kv_bytes(fkv);
+        const size_t cellb = q4 ? kQ4Cell : (size_t) kKvHeads * kv_bytes(fkv);   // one position = every KV head's row (11-24 fix: was one head)
         std::vector<int32_t> pos(R);
         for (int r = 0; r < R; ++r) pos[r] = r;
         int32_t* dpos = dev(pos);
